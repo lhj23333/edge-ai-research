@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="description" content="端侧与边缘推理独立 AI 加速器行业研究站。">
+  <title>{{ title }} · Researcher</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/station.css">
+  <script src="/static/htmx.min.js" defer></script>
+  <script src="/static/app.js" defer></script>
+  <script src="/static/station.js" defer></script>
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="/"><span class="brand-mark">r<span>.</span></span><span>Researcher<small>端侧推理行业研究站</small></span></a>
+    <div class="workspace-label">研究站</div>
+    <nav aria-label="主导航">
+      <a class="{{ 'selected' if path == '/' else '' }}" href="/"><span aria-hidden="true">◈</span>今日简报</a>
+      <a class="{{ 'selected' if path.startswith('/updates') or path.startswith('/events') else '' }}" href="/updates"><span aria-hidden="true">↗</span>行业动态</a>
+      <a class="{{ 'selected' if path.startswith('/map') or path.startswith('/knowledge') else '' }}" href="/map"><span aria-hidden="true">◎</span>认知地图</a>
+      <a class="{{ 'selected' if path.startswith('/companies') or path.startswith('/entities') or path.startswith('/compare') else '' }}" href="/companies"><span aria-hidden="true">▦</span>厂商与产品</a>
+      <a class="{{ 'selected' if path.startswith('/evidence') or path.startswith('/documents') else '' }}" href="/evidence"><span aria-hidden="true">▤</span>证据管理</a>
+      <a class="{{ 'selected' if path.startswith('/questions') else '' }}" href="/questions"><span aria-hidden="true">◇</span>定向研究</a>
+      <a class="{{ 'selected' if path.startswith('/personal') or path.startswith('/annotations') or path.startswith('/library') or path.startswith('/artifacts') or path.startswith('/briefs') else '' }}" href="/personal"><span aria-hidden="true">✎</span>个人区域</a>
+    </nav>
+    <div class="sidebar-bottom">
+      <div class="service-status"><i class="dot {{ 'online' if worker_alive else '' }}"></i>{{ '后台研究服务运行中' if worker_alive else '后台研究服务未运行' }}</div>
+      <a class="settings-link {{ 'selected' if path == '/watchlist' else '' }}" href="/watchlist">☷ 关注与更新设置</a>
+      <a class="settings-link {{ 'selected' if path.startswith('/tasks') else '' }}" href="/tasks">↻ 任务记录</a>
+      <a class="settings-link {{ 'selected' if path == '/settings' else '' }}" href="/settings">⚙ 模型与运行设置</a>
+      <small>本机私有 · Asia/Shanghai</small>
+    </div>
+  </aside>
+  <main class="main">
+    <header class="topbar"><div><span class="topbar-kicker">INDUSTRY RESEARCH</span><span class="topbar-separator">/</span><span>{{ title }}</span></div><span class="private-label">仅本机访问</span></header>
+    <div class="page-content">
+      {% if notice %}<div class="alert success" role="status">{{ notice }}</div>{% endif %}
+      {% if error %}<div class="alert error" role="alert">{{ error }}</div>{% endif %}
+      {% if not worker_alive %}<div class="alert subdued">后台研究服务未运行。阅读和保存可正常使用；排队任务将在后台服务启动后执行。<a href="/settings#operation">查看启动方式</a></div>{% endif %}
+      {% block content %}{% endblock %}
+      <footer class="page-footer"><span>Researcher Web</span><span>行业变化、来源证据与认知修订均保留记录。</span></footer>
+    </div>
+  </main>
+</body>
+</html>

@@ -1,0 +1,17 @@
+{% extends 'base.html' %}{% from 'macros.html' import token with context %}
+{% block content %}
+<div class="page-heading"><div><p class="eyebrow">FOCUSED RESEARCH</p><h1>定向研究</h1><p class="lead">一个主问题、最多三个子问题；明确对象、用途、条件与完成标准。</p></div></div>
+<div class="station-grid"><div><section class="panel"><h2>选择研究动作</h2>
+<div class="action-grid">{% for value,label in [('verify','核实这项说法'),('explain','解释这次更新'),('compare','检查部署条件'),('update','检查专题判断'),('gap','调查证据缺口')] %}<a class="button small" href="/questions?target_kind={{ target_kind }}&target_id={{ target_id }}&event_id={{ event_id }}&claim_id={{ claim_id }}&action={{ value }}">{{ label }}</a>{% endfor %}</div>
+<form action="/questions" method="post" class="stack-form">{{ token() }}<input type="hidden" name="event_id" value="{{ event_id }}"><input type="hidden" name="claim_id" value="{{ claim_id }}">
+<div class="field-row"><label>研究对象类别<select name="target_kind" id="question-target-kind"><option value="topic" {{ 'selected' if target_kind=='topic' else '' }}>专题</option><option value="entity" {{ 'selected' if target_kind=='entity' else '' }}>厂商或产品</option></select></label><label>具体对象<select name="target_id" required><option value="">请选择</option>{% for topic in topics %}<option value="{{ topic.id }}" data-kind="topic" {{ 'selected' if target_kind=='topic' and target_id==topic.id else '' }}>专题 · {{ topic.title }}</option>{% endfor %}{% for item in entities %}<option value="{{ item.id }}" data-kind="entity" {{ 'selected' if target_kind=='entity' and target_id==item.id else '' }}>{{ item.kind }} · {{ item.name }}</option>{% endfor %}</select></label></div>
+<label>研究用途<select name="purpose">{% for purpose in ['行业竞争','部署决策'] %}<option {{ 'selected' if prefill.purpose==purpose else '' }}>{{ purpose }}</option>{% endfor %}</select></label>
+<label>主问题<textarea name="main_question" rows="3" maxlength="500" required placeholder="选择上方动作可自动填写问题范围">{{ prefill.main }}</textarea></label>
+<div class="field-row">{% for index in range(3) %}<label>子问题 {{ index+1 }}<input name="subquestion_{{ index+1 }}" maxlength="300" value="{{ prefill.subquestions[index] }}"></label>{% endfor %}</div>
+<h3>适用条件</h3><div class="field-row"><label>应用场景<input name="scenario" maxlength="200" placeholder="部署决策必填，例如：低功耗边缘视觉"></label><label>模型或任务<input name="model" maxlength="200"></label><label>设备环境<input name="hardware" maxlength="200"></label><label>功耗限制<input name="power" maxlength="200"></label><label>软件要求<input name="software" maxlength="200"></label></div>
+<label>完成标准<textarea name="completion" rows="3" maxlength="500" required>{{ prefill.completion }}</textarea></label>
+{% if event_id %}<p class="field-help">本次问题将明确关联<a href="/events/{{ event_id }}">所选行业事件</a>的资料与证据。</p>{% endif %}
+{% if notes %}<details><summary>选择要带入本次研究的个人批注</summary>{% for note in notes %}<label class="check-row"><input type="checkbox" name="note_id" value="{{ note.id }}"><span>{{ note.body[:140] }}</span></label>{% endfor %}</details>{% endif %}
+<p class="field-help">个人批注只有勾选后才会进入本次研究背景，始终不作为事实证据。证据不足时保留缺口，不生成确定结论。</p><button class="button primary" type="submit">开始定向研究 →</button></form></section></div>
+<aside class="panel"><h2>近期研究问题</h2>{% for item in questions %}<a class="list-item" href="/questions/{{ item.id }}"><strong>{{ item.main_question }}</strong><small>{{ item.purpose }} · {{ {'needs_input':'需要补充条件','ready':'等待执行','running':'研究中','answered':'已回答','partial':'部分回答','failed':'执行失败'}.get(item.status,item.status) }}</small></a>{% else %}<p class="muted">尚无定向研究问题。</p>{% endfor %}</aside></div>
+{% endblock %}

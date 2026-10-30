@@ -1,0 +1,12 @@
+{% from 'macros.html' import token with context %}
+{% macro annotation_form(kind,identifier) %}
+<details class="panel section-space"><summary>写个人批注</summary><form action="/annotations" method="post" class="stack-form">{{ token() }}<input type="hidden" name="target_kind" value="{{ kind }}"><input type="hidden" name="target_id" value="{{ identifier }}"><label>我的想法<textarea name="body" rows="4" required maxlength="20000"></textarea></label><p class="field-help">批注保存在个人区域。只有在定向研究中明确勾选，内容才会发送给 AI；批注不会成为研究证据。</p><button class="button" type="submit">保存批注</button></form></details>
+{% endmacro %}
+{% macro evidence_cards(claims) %}
+{% for claim in claims %}
+<article class="evidence-card"><div class="meta"><span class="badge">{{ claim.label }}</span><span>{{ claim.verification }}</span></div><p><strong>{{ claim.statement }}</strong></p><blockquote>{{ claim.excerpt }}</blockquote>
+<small><a href="/documents/{{ claim.document_id }}">{{ claim.document_title }}</a> · <a href="{{ claim.url }}" target="_blank" rel="noopener noreferrer">来源链接 ↗</a><br>发布日期：{{ claim.published_at or '来源未提供' }} · 最近获取：{{ claim.last_fetched_at|localtime }} · 获取范围：{{ claim.extent }}{% if claim.verified_at %} · 人工核验：{{ claim.verified_at|localtime }}{% endif %}</small>
+<p><a class="text-link" href="/questions?action=verify&claim_id={{ claim.id }}">核实这项说法 →</a></p>
+<details><summary>记录原网页核验结果</summary><form action="/claims/{{ claim.id }}/verify" method="post" class="stack-form">{{ token() }}<label>核对摘录<select name="verification"><option value="待核实">待核实</option><option value="人工核对原网页摘录" {{ 'selected' if claim.verification=='人工核对原网页摘录' else '' }}>摘录吻合</option><option value="人工核对发现不符" {{ 'selected' if claim.verification=='人工核对发现不符' else '' }}>摘录不符</option></select></label><button class="button small" type="submit">保存核验</button></form></details></article>
+{% else %}<p class="muted">尚无可核对的证据记录。</p>{% endfor %}
+{% endmacro %}

@@ -1,0 +1,6 @@
+{% extends 'base.html' %}{% from 'macros.html' import token with context %}
+{% block content %}
+<a class="breadcrumb" href="/personal">← 个人区域</a><div class="article-heading"><p class="eyebrow">{{ '已归档个人批注' if note.archived else '个人批注' }}</p><h1>个人批注</h1><p class="muted"><a href="{{ target.path }}">{{ target.label }} · {{ target.title }}</a> · {{ note.created_at|localtime }}</p></div>
+<div class="station-grid"><div><article class="panel prose">{{ note.body|markdown }}</article><section class="panel section-space"><h2>编辑批注</h2><form action="/annotations/{{ note.id }}" method="post" class="stack-form">{{ token() }}<textarea name="body" rows="10" maxlength="20000" required>{{ note.body }}</textarea><button class="button primary" type="submit">保存新版本</button></form></section></div>
+<aside class="panel"><h2>修改历史</h2>{% for version in versions %}<div class="list-item"><strong>版本 {{ version.version }} · {{ version.created_at|localtime }}</strong><small>{{ version.body[:150] }}</small></div>{% endfor %}<form action="/annotations/{{ note.id }}/archive" method="post" class="section-space">{{ token() }}<input type="hidden" name="archive" value="{{ 'no' if note.archived else 'yes' }}"><button class="button small" type="submit">{{ '恢复批注' if note.archived else '归档批注' }}</button></form></aside></div>
+{% endblock %}

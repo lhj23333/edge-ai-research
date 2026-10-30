@@ -1,0 +1,6 @@
+{% extends 'base.html' %}{% from 'macros.html' import token,sources_list with context %}{% from 'station_macros.html' import annotation_form with context %}
+{% block content %}
+<a class="breadcrumb" href="/topics/{{ brief.topic_id }}">← {{ brief.topic_title }}</a><div class="article-heading"><p class="eyebrow">历史研究简报</p><h1>{{ brief.title }}</h1><div class="meta"><time>{{ brief.created_at|localtime }}</time><a href="/tasks/{{ brief.task_id }}">原研究任务与用量 ↗</a></div></div>
+<div class="station-grid"><div><article class="panel article prose">{{ brief.body|markdown }}</article>{{ annotation_form('brief',brief.id) }}</div><aside><section class="panel"><h2>继续研究</h2><p class="muted">这份历史资料保留原有内容。当前结论可在对应专题中结合新证据查阅。</p><a class="button full" href="/knowledge/{{ brief.topic_id }}">查看专题判断 →</a><a class="button full section-space" href="/questions?action=update&target_kind=topic&target_id={{ brief.topic_id }}">核实与更新专题 →</a><hr><form action="/briefs/{{ brief.id }}/save" method="post">{{ token() }}<button class="button full" type="submit">保存到成果库</button></form></section></aside></div>
+<div class="section-space">{{ sources_list(sources) }}</div>
+{% endblock %}
