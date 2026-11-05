@@ -1,6 +1,30 @@
-{% extends 'base.html' %}{% from 'macros.html' import token with context %}
+{% extends 'base.html' %}
+{% from 'macros.html' import token with context %}
+{% from 'ui.html' import icon %}
 {% block content %}
-<a class="breadcrumb" href="/personal">← 个人区域</a><div class="article-heading"><p class="eyebrow">{{ '已归档个人批注' if note.archived else '个人批注' }}</p><h1>个人批注</h1><p class="muted"><a href="{{ target.path }}">{{ target.label }} · {{ target.title }}</a> · {{ note.created_at|localtime }}</p></div>
-<div class="station-grid"><div><article class="panel prose">{{ note.body|markdown }}</article><section class="panel section-space"><h2>编辑批注</h2><form action="/annotations/{{ note.id }}" method="post" class="stack-form">{{ token() }}<textarea name="body" rows="10" maxlength="20000" required>{{ note.body }}</textarea><button class="button primary" type="submit">保存新版本</button></form></section></div>
-<aside class="panel"><h2>修改历史</h2>{% for version in versions %}<div class="list-item"><strong>版本 {{ version.version }} · {{ version.created_at|localtime }}</strong><small>{{ version.body[:150] }}</small></div>{% endfor %}<form action="/annotations/{{ note.id }}/archive" method="post" class="section-space">{{ token() }}<input type="hidden" name="archive" value="{{ 'no' if note.archived else 'yes' }}"><button class="button small" type="submit">{{ '恢复批注' if note.archived else '归档批注' }}</button></form></aside></div>
+<header class="page-header">
+  <a class="back-link" href="/personal">{{ icon('arrow-left') }}个人区域</a>
+  <div class="page-title">
+    <p class="eyebrow">{{ '已归档个人批注' if note.archived else '个人批注' }}</p>
+    <h1>个人批注</h1>
+    <div class="page-meta"><a href="{{ target.path }}">{{ icon('link') }}{{ target.label }} · {{ target.title }}</a><span>{{ icon('clock') }}<span class="mono">{{ note.created_at|localtime }}</span></span></div>
+  </div>
+</header>
+
+<div class="layout-split">
+  <div class="stack">
+    <article class="panel prose">{{ note.body|markdown }}</article>
+    <section class="panel">
+      <div class="panel-head"><h2>{{ icon('note') }}编辑批注</h2></div>
+      <form action="/annotations/{{ note.id }}" method="post" class="stack-form">{{ token() }}<label><span class="sr-only">批注内容</span><textarea name="body" rows="10" maxlength="20000" required>{{ note.body }}</textarea></label><div class="form-actions"><button class="button primary" type="submit">{{ icon('check') }}保存新版本</button></div></form>
+    </section>
+  </div>
+  <aside class="panel">
+    <div class="panel-head"><h2>{{ icon('clock') }}修改历史</h2><span class="panel-note mono">{{ versions|length }}</span></div>
+    <ol class="timeline">
+      {% for version in versions %}<li class="timeline-item"><strong>版本 {{ version.version }} · <span class="mono">{{ version.created_at|localtime }}</span></strong><small>{{ version.body[:150] }}</small></li>{% endfor %}
+    </ol>
+    <div class="panel-foot"><form action="/annotations/{{ note.id }}/archive" method="post">{{ token() }}<input type="hidden" name="archive" value="{{ 'no' if note.archived else 'yes' }}"><button class="button small ghost {{ '' if note.archived else 'caution' }}" type="submit">{{ icon('archive') }}{{ '恢复批注' if note.archived else '归档批注' }}</button></form></div>
+  </aside>
+</div>
 {% endblock %}

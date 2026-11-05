@@ -1,14 +1,27 @@
+{% from 'ui.html' import icon %}
 {% macro token() %}<input type="hidden" name="csrf" value="{{ csrf }}">{% endmacro %}
-{% macro task_badge(task) %}<span class="badge state-{{ task.status }}">{{ states.get(task.status, task.status) }}</span>{% endmacro %}
+{% macro task_badge(task) %}<span class="badge dot tone-{{ task.status|tone }}">{{ states.get(task.status, task.status) }}</span>{% endmacro %}
 {% macro sources_list(sources) %}
-<section class="panel source-panel"><div class="section-heading"><h2>来源记录</h2><span class="muted">{{ sources|length }} 项</span></div>
-{% for source in sources %}<div class="source-item"><span class="source-index" aria-hidden="true">↗</span><div><a href="{{ source.url }}" target="_blank" rel="noopener noreferrer">{{ source.title }} ↗</a><p class="source-url">{{ source.url }}</p><div class="meta"><span>{{ source.extent }}</span><span>发布：{{ source.published_at or '未提供' }}</span><span>获取：{{ source.fetched_at|localtime }}</span></div>{% if source.content %}<details><summary>查看已获取的资料</summary><div class="source-content">{{ source.content }}</div></details>{% endif %}</div></div>{% else %}<p class="muted">暂无来源记录。</p>{% endfor %}</section>
+<section class="panel source-panel">
+  <div class="panel-head"><h2>{{ icon('link') }}来源记录</h2><span class="panel-note mono">{{ sources|length }} 项</span></div>
+  {% for source in sources %}
+  <article class="source-item">
+    <span class="source-index mono" aria-hidden="true">{{ '%02d'|format(loop.index) }}</span>
+    <div class="source-body">
+      <a class="source-title" href="{{ source.url }}" target="_blank" rel="noopener noreferrer">{{ source.title }}{{ icon('external') }}</a>
+      <p class="source-url mono">{{ source.url }}</p>
+      <div class="meta"><span class="badge">{{ source.extent }}</span><span>发布：{{ source.published_at or '未提供' }}</span><span>获取：<span class="mono">{{ source.fetched_at|localtime }}</span></span></div>
+      {% if source.content %}<details><summary>查看已获取的资料</summary><div class="source-content">{{ source.content }}</div></details>{% endif %}
+    </div>
+  </article>
+  {% else %}<p class="muted">暂无来源记录。</p>{% endfor %}
+</section>
 {% endmacro %}
 {% macro topic_form() %}
 <form action="/topics" method="post" class="stack-form">{{ token() }}
   <label>主题名称<input name="title" required maxlength="160" placeholder="例如：独立 AI 加速器领域概览"></label>
   <label>主题类别<select name="kind"><option>领域</option><option>厂商</option><option>产品</option><option>专题</option></select></label>
   <label>你想了解什么<textarea name="question" rows="4" required maxlength="3000" placeholder="关注哪些产品、能力、应用或研究问题？"></textarea></label>
-  <button class="button primary" type="submit">保存关注主题 <span>↗</span></button>
+  <button class="button primary" type="submit">{{ icon('plus') }}保存关注主题</button>
 </form>
 {% endmacro %}

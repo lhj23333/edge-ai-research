@@ -1,1 +1,21 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>操作提示 · Researcher</title><link rel="stylesheet" href="/static/style.css"></head><body class="error-page"><main class="panel"><p class="eyebrow">RESEARCHER / {{ status }}</p><h1>当前操作无法完成</h1><p>{{ message }}</p><a href="/" class="button primary">返回研究首页 →</a></main></body></html>
+{% from 'ui.html' import icon %}<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0b0d11">
+  <title>操作提示 · Researcher</title>
+  <link rel="icon" href="/static/favicon.svg?v={{ asset_version }}" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/style.css?v={{ asset_version }}">
+</head>
+<body class="error-page">
+  <main class="panel error-card">
+    <span class="empty-icon">{{ icon('alert') }}</span>
+    <p class="eyebrow">Researcher / {{ status }}</p>
+    <h1>当前操作无法完成</h1>
+    <p>{{ message }}</p>
+    <a href="/" class="button primary">返回研究首页{{ icon('arrow-right') }}</a>
+  </main>
+</body>
+</html>

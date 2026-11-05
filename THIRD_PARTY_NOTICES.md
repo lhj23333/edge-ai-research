@@ -16,3 +16,19 @@ FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY
 DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN
 AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
 OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+## Inter 5.2.8
+
+- 项目：https://github.com/rsms/inter
+- 本地文件：`researcher/static/fonts/inter-latin-400.woff2`、`inter-latin-500.woff2`、`inter-latin-600.woff2`
+- 许可证：SIL Open Font License 1.1
+- 原文：https://github.com/rsms/inter/blob/master/LICENSE.txt
+- 来源：https://cdn.jsdelivr.net/fontsource/fonts/inter@5.2.8/
+
+## JetBrains Mono 5.2.8
+
+- 项目：https://github.com/JetBrains/JetBrainsMono
+- 本地文件：`researcher/static/fonts/jetbrains-mono-latin-400.woff2`、`jetbrains-mono-latin-500.woff2`
+- 许可证：SIL Open Font License 1.1
+- 原文：https://github.com/JetBrains/JetBrainsMono/blob/master/OFL.txt
+- 来源：https://cdn.jsdelivr.net/fontsource/fonts/jetbrains-mono@5.2.8/

@@ -1,2 +1,50 @@
 {% extends 'base.html' %}
-{% block content %}<div class="page-heading"><div><p class="eyebrow">PRODUCT COMPARISON</p><h1>产品对比</h1><p class="lead">一次选择最多三款产品。性能、功耗和成本需同时核对模型、精度、批次、设备和测量方法。</p></div></div>{% if error_message %}<div class="alert error">{{ error_message }}</div>{% endif %}<form action="/compare" method="get" class="panel stack-form"><label>选择产品</label><div class="product-options">{% for product in products %}<label class="check-row"><input type="checkbox" name="id" value="{{ product.id }}" {{ 'checked' if selected and product.id in selected|map(attribute='id')|list else '' }}>{{ product.name }}</label>{% else %}<p class="muted">尚无产品记录。采集行业动态后可从厂商资料进入。</p>{% endfor %}</div><button class="button primary" type="submit">查看对比</button></form>{% if selected %}<div class="panel section-space"><h2>比较口径</h2><p class="{{ 'muted' if comparable else 'alert subdued' }}">{{ '已记录相同的测试条件文本；仍需查看各来源是否使用相同版本和测量方法。' if comparable else '测试条件不完整或不一致，性能与功耗数字暂不能直接排名。' }}</p><div class="table-scroll"><table class="compare-table"><thead><tr><th>维度</th>{% for item in selected %}<th><a href="/entities/{{ item.id }}">{{ item.name }}</a></th>{% endfor %}</tr></thead><tbody>{% for row in rows %}<tr><th>{{ row.name }}</th>{% for value in row['values'] %}<td>{% if value %}{{ value.value }}<br><small><span class="badge">{{ value.label or '待核实' }}</span>{% if value.url %} · <a href="{{ value.url }}" target="_blank" rel="noopener noreferrer">来源 ↗</a>{% endif %}</small>{% else %}<span class="muted">尚无可核对资料</span>{% endif %}</td>{% endfor %}</tr>{% endfor %}</tbody></table></div></div>{% endif %}{% endblock %}
+{% from 'ui.html' import icon, page_header, bar %}
+{% block content %}
+{% set chosen = selected|map(attribute='id')|list if selected else [] %}
+{{ page_header('Product comparison', '产品对比', '一次选择最多三款产品。性能、功耗和成本需同时核对模型、精度、批次、设备和测量方法。') }}
+{% if error_message %}<div class="alert tone-danger">{{ icon('alert') }}<p>{{ error_message }}</p></div>{% endif %}
+
+<form action="/compare" method="get" class="panel compare-picker" data-compare-picker>
+  <div class="panel-head"><h2>{{ icon('chip') }}选择产品</h2><span class="badge tone-accent" data-compare-count aria-live="polite">已选择 {{ chosen|length }} / 3</span></div>
+  <div class="product-options">
+    {% for product in products %}<label class="select-card"><input type="checkbox" name="id" value="{{ product.id }}" {{ 'checked' if product.id in chosen else '' }}><span class="select-mark" aria-hidden="true">{{ icon('check') }}</span><span>{{ product.name }}</span></label>{% else %}<p class="muted">尚无产品记录。采集行业动态后可从厂商资料进入。</p>{% endfor %}
+  </div>
+  <div class="form-actions"><button class="button primary" type="submit">{{ icon('bars') }}查看对比</button></div>
+</form>
+
+{% if selected %}
+<section class="panel section-space">
+  <div class="panel-head"><h2>{{ icon('bars') }}比较口径</h2><span class="panel-note mono">{{ selected|length }} 款产品 · {{ rows|length }} 个维度</span></div>
+  {% if comparable %}<p class="muted">已记录相同的测试条件文本；仍需查看各来源是否使用相同版本和测量方法。</p>
+  {% else %}<div class="alert tone-warning">{{ icon('alert') }}<p>测试条件不完整或不一致，性能与功耗数字暂不能直接排名。</p></div>{% endif %}
+  <div class="table-scroll section-space">
+    <table class="compare-table">
+      <thead>
+        <tr>
+          <th scope="col">维度</th>
+          {% for item in selected %}
+          {% set column = loop.index0 %}{% set coverage = namespace(n=0) %}
+          {% for row in rows %}{% if row['values'][column] %}{% set coverage.n = coverage.n + 1 %}{% endif %}{% endfor %}
+          <th scope="col" class="compare-col">
+            <a class="compare-product" href="/entities/{{ item.id }}">{{ item.name }}</a>
+            <span class="compare-coverage"><span class="mono">{{ coverage.n }}/{{ rows|length }}</span>{{ bar(coverage.n, rows|length, 'success' if coverage.n == rows|length else 'accent') }}</span>
+          </th>
+          {% endfor %}
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+        <tr>
+          <th scope="row">{{ row.name }}</th>
+          {% for value in row['values'] %}
+          <td>{% if value %}<p class="compare-value">{{ value.value }}</p><div class="meta"><span class="badge tone-{{ (value.label or '待核实')|tone }}">{{ value.label or '待核实' }}</span>{% if value.url %}<a href="{{ value.url }}" target="_blank" rel="noopener noreferrer">来源{{ icon('external') }}</a>{% endif %}</div>{% else %}<span class="compare-missing">尚无可核对资料</span>{% endif %}</td>
+          {% endfor %}
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}
+{% endblock %}

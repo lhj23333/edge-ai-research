@@ -1,12 +1,101 @@
-{% extends 'base.html' %}{% from 'macros.html' import token with context %}{% from 'station_macros.html' import annotation_form with context %}
+{% extends 'base.html' %}
+{% from 'macros.html' import token with context %}
+{% from 'station_macros.html' import annotation_form with context %}
+{% from 'ui.html' import icon %}
 {% block content %}
-<a class="breadcrumb" href="/map">← 认知地图</a><div class="article-heading"><p class="eyebrow">RESEARCH TOPIC · {{ {'active':'持续关注','historical':'历史资料','archived':'已归档'}.get(topic.research_state,topic.research_state) }}</p><h1>{{ topic.title }}</h1><p class="lead">{{ topic.question }}</p></div>
-<div class="station-grid"><div><section class="panel"><h2>当前认识 <span class="badge">分析判断</span></h2>
-{% for judgment in judgments %}<article class="judgment-card"><div class="meta"><span class="badge">{{ judgment.purpose }}</span><span>{{ judgment.status }}</span><span>{{ judgment.revised_at|localtime if judgment.revised_at else '尚未修订' }}</span></div><h3>{{ judgment.conclusion or '当前仍缺少足够证据' }}</h3><p><strong>适用边界：</strong>{{ judgment.boundaries or '尚未明确' }}</p><p><strong>未解决问题：</strong>{{ judgment.unresolved or '尚无记录' }}</p><p><strong>最近修订原因：</strong>{{ judgment.reason or '尚无记录' }}</p></article>{% else %}<p class="muted">尚无有依据的当前判断。采集到相关事件后会评估是否需要建立判断。</p>{% endfor %}</section>
-<section class="panel section-space"><h2>当前支持与反对证据</h2>{% for item in current_evidence %}<article class="evidence-card"><div class="meta"><span class="badge">{{ item.purpose }} · {{ item.stance }}</span><span>{{ item.label }}</span><span>{{ item.verification }}</span></div><p>{{ item.statement }}</p><blockquote>{{ item.excerpt }}</blockquote><small><a href="/documents/{{ item.document_id }}">{{ item.document_title }}</a> · <a href="{{ item.url }}" target="_blank" rel="noopener noreferrer">来源 ↗</a> · 发布：{{ item.published_at or '未提供' }} · 获取：{{ item.last_fetched_at|localtime }} · {{ item.extent }}</small><p><a class="text-link" href="/questions?action=verify&claim_id={{ item.id }}">核实这项说法 →</a></p></article>{% else %}<p class="muted">尚无支持或反对证据。</p>{% endfor %}</section>
-{{ annotation_form('topic',topic.id) }}</div>
-<aside><section class="panel"><h2>修订历史</h2>{% for item in versions %}<details class="list-item"><summary>版本 {{ item.version }} · {{ item.purpose }} · {{ item.status }}</summary><p class="muted">{{ item.created_at|localtime }}</p><p><strong>此前判断：</strong>{{ item.previous_conclusion or '尚未建立判断' }}</p><p><strong>本次判断：</strong>{{ item.conclusion }}</p><p><strong>修订原因：</strong>{{ item.reason }}</p>{% if item.event_id %}<a class="text-link" href="/events/{{ item.event_id }}">相关行业事件 →</a>{% endif %}{% for source in evidence if source.version_id==item.id %}<p><small>{{ source.stance }} · {{ source.label }} · <a href="/documents/{{ source.document_id }}">{{ source.statement }}</a></small></p>{% endfor %}</details>{% else %}<p class="muted">尚无修订记录。</p>{% endfor %}</section>
-<section class="panel section-space"><h2>关联行业事件</h2>{% for event in events %}<a class="list-item" href="/events/{{ event.id }}"><strong>{{ event.title }}</strong><small>{{ event.impact }}</small></a>{% else %}<p class="muted">尚无关联事件。</p>{% endfor %}</section>
-{% if topic.research_state!='archived' %}<form action="/knowledge/{{ topic.id }}/revise" method="post" class="section-space">{{ token() }}<button class="button primary full" type="submit">根据已有证据更新专题</button></form>{% endif %}<a class="button full section-space" href="/questions?action=update&target_kind=topic&target_id={{ topic.id }}">调查判断与证据缺口 →</a><a class="text-link section-space" href="/topics/{{ topic.id }}">查看历史研究资料 →</a>
-{% if topic.research_state!='archived' %}<form action="/knowledge/{{ topic.id }}/archive" method="post" class="section-space">{{ token() }}<button class="button small" type="submit">归档专题</button></form>{% endif %}</aside></div>
+<header class="page-header">
+  <a class="back-link" href="/map">{{ icon('arrow-left') }}认知地图</a>
+  <div class="page-title">
+    <p class="eyebrow">Research topic · {{ {'active':'持续关注','historical':'历史资料','archived':'已归档'}.get(topic.research_state, topic.research_state) }}</p>
+    <h1>{{ topic.title }}</h1>
+    <p class="lead">{{ topic.question }}</p>
+  </div>
+</header>
+
+<div class="layout-split">
+  <div class="stack">
+    <section class="panel">
+      <div class="panel-head"><h2>{{ icon('spark') }}当前认识<span class="badge tone-accent">分析判断</span></h2><span class="panel-note mono">{{ judgments|length }} 项</span></div>
+      <div class="stack-sm">
+        {% for judgment in judgments %}
+        <article class="judgment-card">
+          <div class="meta"><span class="badge">{{ judgment.purpose }}</span><span class="badge dot tone-{{ judgment.status|tone }}">{{ judgment.status }}</span><span class="mono">{{ judgment.revised_at|localtime if judgment.revised_at else '尚未修订' }}</span></div>
+          <h3>{{ judgment.conclusion or '当前仍缺少足够证据' }}</h3>
+          <dl class="fact-grid">
+            <div><dt>适用边界</dt><dd>{{ judgment.boundaries or '尚未明确' }}</dd></div>
+            <div><dt>未解决问题</dt><dd>{{ judgment.unresolved or '尚无记录' }}</dd></div>
+            <div><dt>最近修订原因</dt><dd>{{ judgment.reason or '尚无记录' }}</dd></div>
+          </dl>
+        </article>
+        {% else %}<p class="muted">尚无有依据的当前判断。采集到相关事件后会评估是否需要建立判断。</p>{% endfor %}
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head"><h2>{{ icon('evidence') }}当前支持与反对证据</h2><span class="panel-note mono">{{ current_evidence|length }} 条</span></div>
+      <div class="evidence-list">
+        {% for item in current_evidence %}
+        <article class="evidence-card stance-{{ item.stance|tone }}">
+          <div class="evidence-head">
+            <span class="badge dot tone-{{ item.stance|tone }}">{{ item.purpose }} · {{ item.stance }}</span>
+            <span class="badge tone-{{ item.label|tone }}">{{ item.label }}</span>
+            <span class="verification tone-{{ item.verification|tone }}">{{ item.verification }}</span>
+          </div>
+          <p class="evidence-statement">{{ item.statement }}</p>
+          <blockquote class="excerpt">{{ item.excerpt }}</blockquote>
+          <div class="evidence-source">
+            <a href="/documents/{{ item.document_id }}">{{ icon('evidence') }}<span>{{ item.document_title }}</span></a>
+            <a href="{{ item.url }}" target="_blank" rel="noopener noreferrer">来源{{ icon('external') }}</a>
+          </div>
+          <div class="meta"><span>发布：<span class="mono">{{ item.published_at or '未提供' }}</span></span><span>获取：<span class="mono">{{ item.last_fetched_at|localtime }}</span></span><span>{{ item.extent }}</span></div>
+          <div class="evidence-actions"><a class="text-link" href="/questions?action=verify&claim_id={{ item.id }}">核实这项说法{{ icon('arrow-right') }}</a></div>
+        </article>
+        {% else %}<p class="muted">尚无支持或反对证据。</p>{% endfor %}
+      </div>
+    </section>
+    {{ annotation_form('topic', topic.id) }}
+  </div>
+
+  <aside class="stack">
+    <section class="panel">
+      <div class="panel-head"><h2>{{ icon('clock') }}修订历史</h2></div>
+      {% if versions %}
+      <ol class="timeline">
+        {% for item in versions %}
+        <li class="timeline-item tone-{{ item.status|tone }}">
+          <details>
+            <summary>版本 {{ item.version }} · {{ item.purpose }} · {{ item.status }}</summary>
+            <div class="timeline-body">
+              <p class="muted mono">{{ item.created_at|localtime }}</p>
+              <dl class="fact-grid">
+                <div><dt>此前判断</dt><dd>{{ item.previous_conclusion or '尚未建立判断' }}</dd></div>
+                <div><dt>本次判断</dt><dd>{{ item.conclusion }}</dd></div>
+                <div><dt>修订原因</dt><dd>{{ item.reason }}</dd></div>
+              </dl>
+              {% if item.event_id %}<a class="text-link" href="/events/{{ item.event_id }}">相关行业事件{{ icon('arrow-right') }}</a>{% endif %}
+              {% for source in evidence if source.version_id==item.id %}<p class="timeline-source"><span class="badge dot tone-{{ source.stance|tone }}">{{ source.stance }}</span><span class="badge tone-{{ source.label|tone }}">{{ source.label }}</span><a href="/documents/{{ source.document_id }}">{{ source.statement }}</a></p>{% endfor %}
+            </div>
+          </details>
+        </li>
+        {% endfor %}
+      </ol>
+      {% else %}<p class="muted">尚无修订记录。</p>{% endif %}
+    </section>
+    <section class="panel">
+      <div class="panel-head"><h2>{{ icon('pulse') }}关联行业事件</h2></div>
+      <div class="list">
+        {% for event in events %}<a class="list-item" href="/events/{{ event.id }}"><strong>{{ event.title }}</strong><small>{{ event.impact }}</small></a>{% else %}<p class="muted">尚无关联事件。</p>{% endfor %}
+      </div>
+    </section>
+    <section class="panel">
+      <div class="panel-head"><h2>{{ icon('target') }}继续研究</h2></div>
+      <div class="stack-sm">
+        {% if topic.research_state!='archived' %}<form action="/knowledge/{{ topic.id }}/revise" method="post">{{ token() }}<button class="button primary full" type="submit">{{ icon('refresh') }}根据已有证据更新专题</button></form>{% endif %}
+        <a class="button full" href="/questions?action=update&target_kind=topic&target_id={{ topic.id }}">{{ icon('search') }}调查判断与证据缺口</a>
+        <a class="text-link" href="/topics/{{ topic.id }}">查看历史研究资料{{ icon('arrow-right') }}</a>
+      </div>
+      {% if topic.research_state!='archived' %}<div class="panel-foot"><form action="/knowledge/{{ topic.id }}/archive" method="post">{{ token() }}<button class="button small ghost caution" type="submit">{{ icon('archive') }}归档专题</button></form></div>{% endif %}
+    </section>
+  </aside>
+</div>
 {% endblock %}

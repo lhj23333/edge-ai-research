@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import hmac
 import json
 import secrets
@@ -41,9 +42,74 @@ def local_time(value):
     return datetime.fromisoformat(value).astimezone(ZoneInfo(settings()["limits"]["timezone"])).strftime("%Y-%m-%d %H:%M")
 
 
+def asset_version():
+    digest = hashlib.sha256()
+    root = HERE / "static"
+    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+        digest.update(path.relative_to(root).as_posix().encode())
+        digest.update(path.read_bytes())
+    return digest.hexdigest()[:12]
+
+
+TONES = {
+    "queued": "neutral", "running": "running", "success": "success", "failed": "danger", "cancelled": "neutral", "interrupted": "warning",
+    "complete": "success", "partial": "warning", "never": "neutral", "needs_input": "warning", "ready": "neutral", "answered": "success",
+    "公开披露": "success", "厂商宣称": "warning", "分析判断": "accent", "待核实": "pending",
+    "人工核对原网页摘录": "success", "人工核对发现不符": "danger",
+    "初步判断": "accent", "得到加强": "success", "需要修正": "warning", "存在争议": "danger",
+    "支持": "success", "反对": "danger",
+}
+KIND_KEYS = {"厂商": "company", "产品": "product", "应用场景": "scenario", "技术路线": "route", "软件生态": "software"}
+NAVIGATION = (
+    {"label": "Workspace", "links": (
+        {"href": "/", "label": "今日简报", "icon": "overview", "match": ("/",)},
+        {"href": "/updates", "label": "行业动态", "icon": "pulse", "match": ("/updates", "/events")},
+        {"href": "/map", "label": "认知地图", "icon": "graph", "match": ("/map", "/knowledge")},
+    )},
+    {"label": "Hardware", "links": (
+        {"href": "/companies", "label": "厂商与产品", "icon": "chip", "match": ("/companies", "/entities"), "children": (
+            {"href": "/compare", "label": "产品对比", "match": ("/compare",)},
+        )},
+        {"href": "/evidence", "label": "证据管理", "icon": "evidence", "match": ("/evidence", "/documents")},
+    )},
+    {"label": "Research", "links": (
+        {"href": "/questions", "label": "定向研究", "icon": "target", "match": ("/questions",)},
+        {"href": "/personal", "label": "个人区域", "icon": "note", "match": ("/personal", "/annotations"), "children": (
+            {"href": "/library", "label": "成果库", "match": ("/library", "/artifacts")},
+            {"href": "/topics", "label": "历史主题", "match": ("/topics", "/briefs")},
+        )},
+    )},
+    {"label": "System", "system": True, "links": (
+        {"href": "/watchlist", "label": "关注与更新设置", "icon": "eye", "match": ("/watchlist",)},
+        {"href": "/tasks", "label": "任务记录", "icon": "terminal", "match": ("/tasks",)},
+        {"href": "/settings", "label": "模型与运行设置", "icon": "sliders", "match": ("/settings",)},
+    )},
+)
+
+
+def navigation(path):
+    def hit(link):
+        return any(path == prefix if prefix == "/" else path.startswith(prefix) for prefix in link["match"])
+
+    groups, trail = [], []
+    for group in NAVIGATION:
+        links = []
+        for link in group["links"]:
+            children = [dict(child, current=hit(child)) for child in link.get("children", ())]
+            current = hit(link)
+            active_child = next((child for child in children if child["current"]), None)
+            if current or active_child:
+                trail = [(group["label"], None), (link["label"], link["href"])] + ([(active_child["label"], active_child["href"])] if active_child else [])
+            links.append(dict(link, current=current, expanded=current or bool(active_child), children=children))
+        groups.append(dict(group, links=links))
+    return {"groups": groups, "trail": trail}
+
+
 templates.env.filters["markdown"] = render_markdown
 templates.env.filters["localtime"] = local_time
-templates.env.globals.update(states=STATES, kinds=KINDS, presets=PRESETS)
+templates.env.filters["tone"] = lambda value: TONES.get(value, "neutral")
+templates.env.filters["kind_key"] = lambda value: KIND_KEYS.get(value, "other")
+templates.env.globals.update(states=STATES, kinds=KINDS, presets=PRESETS, asset_version=asset_version())
 
 
 @asynccontextmanager
@@ -95,7 +161,7 @@ def page(request, name, **values):
     return templates.TemplateResponse(request=request, name=name, context={
         "config": settings(), "worker_alive": worker_alive(),
         "csrf": request.state.csrf, "notice": request.query_params.get("notice"),
-        "error": request.query_params.get("error"), "path": request.url.path, **values,
+        "error": request.query_params.get("error"), "path": request.url.path, "nav": navigation(request.url.path), **values,
     })
 
 

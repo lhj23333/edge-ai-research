@@ -1,2 +1,37 @@
-{% extends 'base.html' %}{% from 'macros.html' import token with context %}
-{% block content %}<div class="page-heading"><div><p class="eyebrow">COMPANIES & PRODUCTS</p><h1>厂商与产品</h1><p class="lead">从业务、客户、价格、渠道、伙伴和产品部署条件理解竞争。</p></div><a class="button" href="/compare">比较产品 →</a></div><form action="/companies" method="get" class="panel filter-row"><label>搜索名称<input name="q" value="{{ q }}"></label><label>对象类别<select name="kind"><option value="">全部</option>{% for value in ['厂商','产品','应用场景','技术路线','软件生态'] %}<option value="{{ value }}" {{ 'selected' if kind==value else '' }}>{{ value }}</option>{% endfor %}</select></label><button class="button" type="submit">筛选</button></form><div class="entity-grid">{% for item in entities %}<a class="panel entity-card" href="/entities/{{ item.id }}"><div class="meta"><span class="badge">{{ item.kind }}</span><span>{{ '正在关注' if item.followed else '研究资料' }}</span></div><h2>{{ item.name }}</h2><p>{{ item.summary or '查看已收集的资料、事件和证据。' }}</p><small>{{ item.field_count }} 项已记录字段 · 阅读档案 →</small></a>{% else %}<div class="panel empty-small"><h2>尚无匹配对象</h2><p>请在关注名单生成或手动添加厂商。</p><a class="button" href="/watchlist">前往关注设置 →</a></div>{% endfor %}</div>{% endblock %}
+{% extends 'base.html' %}
+{% from 'ui.html' import icon, kind_icon, page_header, empty %}
+{% block content %}
+{% call page_header('Hardware research', '厂商与产品', '从业务、客户、价格、渠道、伙伴和产品部署条件理解竞争。') %}
+  <a class="button primary" href="/compare">{{ icon('bars') }}比较产品</a>
+{% endcall %}
+
+<div class="filter-bar">
+  <nav class="chips" aria-label="对象类别">
+    <a class="chip {{ '' if kind else 'is-active' }}" href="/companies{{ '?q=' ~ q|urlencode if q else '' }}" {% if not kind %}aria-current="true"{% endif %}>全部<span class="count">{{ kind_counts.values()|sum }}</span></a>
+    {% for value in kinds_order %}<a class="chip {{ 'is-active' if kind == value else '' }}" href="/companies?kind={{ value|urlencode }}{{ '&q=' ~ q|urlencode if q else '' }}" {% if kind == value %}aria-current="true"{% endif %}><i class="chip-dot kind-{{ value|kind_key }}"></i>{{ value }}<span class="count">{{ kind_counts.get(value, 0) }}</span></a>{% endfor %}
+  </nav>
+  <form action="/companies" method="get" class="search-inline" role="search" aria-label="搜索厂商与产品">
+    {% if kind %}<input type="hidden" name="kind" value="{{ kind }}">{% endif %}
+    <label class="input-icon">{{ icon('search') }}<span class="sr-only">搜索名称</span><input type="search" name="q" value="{{ q }}" placeholder="搜索厂商、产品或软件名称"></label>
+    <button class="button" type="submit">筛选</button>
+  </form>
+</div>
+
+<div class="entity-grid">
+  {% for item in entities %}
+  <a class="panel entity-card kind-{{ item.kind|kind_key }}" href="/entities/{{ item.id }}">
+    <div class="entity-card-head">
+      {{ kind_icon(item.kind) }}
+      <span class="badge">{{ item.kind }}</span>
+      {% if item.followed %}<span class="badge dot tone-success">正在关注</span>{% else %}<span class="entity-state">研究资料</span>{% endif %}
+    </div>
+    <h2>{{ item.name }}</h2>
+    <p>{{ item.summary or '查看已收集的资料、事件和证据。' }}</p>
+    {% if item.field_names %}<div class="tags">{% for name in item.field_names.split(',') %}<span class="tag">{{ name }}</span>{% endfor %}</div>{% endif %}
+    <div class="entity-card-foot"><span class="mono">{{ item.field_count }} 项已记录字段</span><span class="entity-card-cta">阅读档案{{ icon('arrow-right') }}</span></div>
+  </a>
+  {% else %}
+  {% call empty('尚无匹配对象', '请在关注名单生成或手动添加厂商。', 'search', 'h2') %}<a class="button" href="/watchlist">前往关注设置{{ icon('arrow-right') }}</a>{% endcall %}
+  {% endfor %}
+</div>
+{% endblock %}

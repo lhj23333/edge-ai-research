@@ -7,6 +7,7 @@ document.addEventListener("DOMContentLoaded", () => {
       }).catch(() => {
         const notice = document.createElement("p");
         notice.setAttribute("role", "status");
+        notice.className = "alert tone-warning";
         notice.textContent = "本次阅读进度未能保存，补读入口将继续保留。";
         visit.insertAdjacentElement("beforebegin", notice);
       });
@@ -27,69 +28,108 @@ document.addEventListener("DOMContentLoaded", () => {
 
   const container = document.getElementById("knowledge-graph");
   if (!container) return;
+  const showMessage = (text) => {
+    const message = document.createElement("p");
+    message.className = "graph-empty";
+    message.textContent = text;
+    container.replaceChildren(message);
+  };
   fetch("/map/data").then((response) => response.json()).then(({entities, relations}) => {
     if (!entities.length) {
-      container.textContent = "尚无关系节点。确认关注名单并完成资料采集后会显示。";
+      showMessage("尚无关系节点。确认关注名单并完成资料采集后会显示。");
       return;
     }
     const groups = ["应用场景", "厂商", "产品", "技术路线", "软件生态"];
+    const kindKeys = {"应用场景": "scenario", "厂商": "company", "产品": "product", "技术路线": "route", "软件生态": "software"};
+    const column = 220;
+    const nodeWidth = 176;
+    const nodeHeight = 44;
+    const rowHeight = 60;
+    const top = 64;
     const positions = new Map();
     const counts = new Map(groups.map((name) => [name, 0]));
-    const width = 1120;
     for (const item of entities) {
-      const column = Math.max(0, groups.indexOf(item.kind));
-      const row = counts.get(groups[column]);
-      counts.set(groups[column], row + 1);
-      positions.set(item.id, {x: 28 + column * 220, y: 82 + row * 62});
+      const index = Math.max(0, groups.indexOf(item.kind));
+      const row = counts.get(groups[index]);
+      counts.set(groups[index], row + 1);
+      positions.set(item.id, {x: 24 + index * column, y: top + row * rowHeight});
     }
-    const height = Math.max(220, 130 + Math.max(...counts.values()) * 62);
+    const width = 24 * 2 + (groups.length - 1) * column + nodeWidth;
+    const height = Math.max(220, top + Math.max(...counts.values()) * rowHeight + 12);
     const ns = "http://www.w3.org/2000/svg";
-    const svg = document.createElementNS(ns, "svg");
-    svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
-    svg.setAttribute("width", width);
-    svg.setAttribute("height", height);
-    for (let i = 0; i < groups.length; i++) {
-      const heading = document.createElementNS(ns, "text");
-      heading.setAttribute("x", 28 + i * 220);
-      heading.setAttribute("y", 32);
-      heading.setAttribute("class", "map-heading");
-      heading.textContent = groups[i];
+    const create = (name, attributes) => {
+      const element = document.createElementNS(ns, name);
+      for (const [key, value] of Object.entries(attributes)) element.setAttribute(key, value);
+      return element;
+    };
+    const svg = create("svg", {viewBox: `0 0 ${width} ${height}`, width, height, class: "graph-canvas"});
+    groups.forEach((name, index) => {
+      const x = 24 + index * column;
+      svg.append(create("rect", {x: x - 10, y: 14, width: nodeWidth + 20, height: height - 22, rx: 12, class: "graph-lane"}));
+      const heading = create("text", {x, y: 40, class: "map-heading"});
+      heading.textContent = `${name} · ${counts.get(name)}`;
       svg.append(heading);
-    }
+    });
+    const curve = (from, to) => {
+      const fromY = from.y + nodeHeight / 2;
+      const toY = to.y + nodeHeight / 2;
+      if (from.x === to.x) {
+        const x = from.x + nodeWidth;
+        return `M ${x} ${fromY} C ${x + 38} ${fromY}, ${x + 38} ${toY}, ${x} ${toY}`;
+      }
+      const forward = to.x > from.x;
+      const startX = forward ? from.x + nodeWidth : from.x;
+      const endX = forward ? to.x : to.x + nodeWidth;
+      const middle = (startX + endX) / 2;
+      return `M ${startX} ${fromY} C ${middle} ${fromY}, ${middle} ${toY}, ${endX} ${toY}`;
+    };
+    const edges = [];
     for (const relation of relations) {
       const from = positions.get(relation.from_entity_id);
       const to = positions.get(relation.to_entity_id);
       if (!from || !to) continue;
-      const line = document.createElementNS(ns, "path");
-      line.setAttribute("d", `M ${from.x + 170} ${from.y + 21} C ${(from.x + to.x) / 2 + 100} ${from.y + 21}, ${(from.x + to.x) / 2 + 100} ${to.y + 21}, ${to.x} ${to.y + 21}`);
-      line.setAttribute("fill", "none");
-      line.setAttribute("stroke", "#9cbdac");
-      line.setAttribute("stroke-width", "2");
+      const line = create("path", {d: curve(from, to), pathLength: 1, class: "graph-edge", "data-from": relation.from_entity_id, "data-to": relation.to_entity_id});
       const title = document.createElementNS(ns, "title");
       title.textContent = `${relation.relation_type}：${relation.explanation}`;
       line.append(title);
+      edges.push(line);
       svg.append(line);
     }
+    const nodes = [];
     for (const item of entities) {
       const point = positions.get(item.id);
-      const link = document.createElementNS(ns, "a");
-      link.setAttribute("href", `/entities/${item.id}`);
-      const rect = document.createElementNS(ns, "rect");
-      for (const [key, value] of Object.entries({x: point.x, y: point.y, width: 175, height: 43, rx: 10})) rect.setAttribute(key, value);
-      rect.setAttribute("fill", "#fff");
-      rect.setAttribute("stroke", "#b9d0bf");
-      const label = document.createElementNS(ns, "text");
-      label.setAttribute("x", point.x + 10);
-      label.setAttribute("y", point.y + 27);
-      label.setAttribute("class", "map-label");
-      label.textContent = item.name.length > 14 ? item.name.slice(0, 13) + "…" : item.name;
+      const link = create("a", {href: `/entities/${item.id}`, class: `graph-node kind-${kindKeys[item.kind] || "other"}`, "data-id": item.id});
+      const box = create("rect", {x: point.x, y: point.y, width: nodeWidth, height: nodeHeight, rx: 10, class: "graph-node-box"});
+      const marker = create("circle", {cx: point.x + 16, cy: point.y + nodeHeight / 2, r: 4, class: "graph-node-dot"});
+      const label = create("text", {x: point.x + 28, y: point.y + 27, class: "map-label"});
+      label.textContent = item.name.length > 13 ? item.name.slice(0, 12) + "…" : item.name;
       const title = document.createElementNS(ns, "title");
       title.textContent = `${item.kind}：${item.name}。${item.summary || "点击阅读档案与资料"}`;
-      link.append(rect, label, title);
+      link.append(box, marker, label, title);
+      nodes.push(link);
       svg.append(link);
     }
-    container.append(svg);
+    const highlight = (id) => {
+      const related = new Set();
+      svg.classList.toggle("has-focus", id !== null);
+      for (const edge of edges) {
+        const linked = id !== null && (edge.dataset.from === id || edge.dataset.to === id);
+        edge.classList.toggle("is-related", linked);
+        if (linked) related.add(edge.dataset.from).add(edge.dataset.to);
+      }
+      for (const node of nodes) {
+        node.classList.toggle("is-focused", node.dataset.id === id);
+        node.classList.toggle("is-related", related.has(node.dataset.id));
+      }
+    };
+    for (const node of nodes) {
+      node.addEventListener("pointerenter", () => highlight(node.dataset.id));
+      node.addEventListener("pointerleave", () => highlight(null));
+      node.addEventListener("focus", () => highlight(node.dataset.id));
+      node.addEventListener("blur", () => highlight(null));
+    }
+    container.replaceChildren(svg);
   }).catch(() => {
-    container.textContent = "关系图暂时无法读取，请使用下方文字列表。";
+    showMessage("关系图暂时无法读取，请使用下方文字列表。");
   });
 });

@@ -1,4 +1,5 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, Request
@@ -8,6 +9,10 @@ from . import db, station
 from .config import get_profile, settings
 from .providers import Source
 from .scheduler import next_run
+from .service import usage_summary
+
+COMPARE_FIELDS = ("业务定位", "模型覆盖", "性能", "功耗成本", "软件迁移", "测试条件", "收费")
+LABEL_ORDER = ("公开披露", "厂商宣称", "分析判断", "待核实")
 
 
 def rows_by_ids(table, ids):
@@ -61,7 +66,46 @@ def home_context():
     latest_revision = db.one("SELECT result_json FROM tasks WHERE kind='revise' AND status='success' AND finished_at>? ORDER BY id DESC LIMIT 1", (issue["created_at"] if issue else day_start,))
     if latest_revision:
         next_questions = list(dict.fromkeys(station.decode(latest_revision["result_json"]).get("questions", []) + next_questions))
-    return {"station": state, "issue": issue, "events": [item for item in events if not item["background"] and item["state"] == "active"][:5], "background_events": [item for item in events if item["background"] and item["state"] == "active"][:5], "revisions": revisions, "progress": progress, "next_questions": next_questions, "catchup_events": catchup_events, "catchup_revisions": catchup_revisions, "task_count": db.one("SELECT count(*) AS n FROM tasks WHERE status IN ('queued','running')")["n"]}
+    return {"station": state, "issue": issue, "events": [item for item in events if not item["background"] and item["state"] == "active"][:5], "background_events": [item for item in events if item["background"] and item["state"] == "active"][:5], "revisions": revisions, "progress": progress, "next_questions": next_questions, "catchup_events": catchup_events, "catchup_revisions": catchup_revisions, "task_count": db.one("SELECT count(*) AS n FROM tasks WHERE status IN ('queued','running')")["n"], **dashboard_context()}
+
+
+def dashboard_context():
+    def total(sql):
+        return db.one(sql)["n"]
+
+    metrics = {
+        "companies": total("SELECT count(*) AS n FROM entities WHERE kind='厂商' AND state!='archived'"),
+        "followed": total("SELECT count(*) AS n FROM entities WHERE kind='厂商' AND followed=1 AND state='active'"),
+        "products": total("SELECT count(*) AS n FROM entities WHERE kind='产品' AND state!='archived'"),
+        "software": total("SELECT count(*) AS n FROM entities WHERE kind='软件生态' AND state!='archived'"),
+        "events": total("SELECT count(*) AS n FROM events WHERE state='active'"),
+        "documents": total("SELECT count(*) AS n FROM documents"),
+        "claims": total("SELECT count(*) AS n FROM claims"),
+        "verified": total("SELECT count(*) AS n FROM claims WHERE verification='人工核对原网页摘录'"),
+        "topics": total("SELECT count(*) AS n FROM topics WHERE research_state='active'"),
+        "judgments": total("SELECT count(*) AS n FROM judgments j JOIN topics t ON t.id=j.topic_id WHERE j.current_version_id IS NOT NULL AND t.research_state='active'"),
+    }
+    labels = {row["label"]: row["n"] for row in db.query("SELECT label,count(*) AS n FROM claims GROUP BY label")}
+    today = datetime.now(ZoneInfo(settings()["limits"]["timezone"])).date()
+    days = [(today - timedelta(days=offset)).isoformat() for offset in range(6, -1, -1)]
+    requests = {row["day"]: row["n"] for row in db.query("SELECT day,count(*) AS n FROM usage WHERE day>=? GROUP BY day", (days[0],))}
+    products = db.query(
+        "SELECT e.id,e.name,(SELECT value FROM entity_fields f WHERE f.entity_id=e.id AND f.field_name='性能' ORDER BY f.id DESC LIMIT 1) AS performance,"
+        "(SELECT count(DISTINCT field_name) FROM entity_fields f WHERE f.entity_id=e.id AND f.field_name IN (" + ",".join("?" for _ in COMPARE_FIELDS) + ")) AS dimensions "
+        "FROM entities e WHERE e.kind='产品' AND e.state!='archived' ORDER BY dimensions DESC,e.name LIMIT 4",
+        COMPARE_FIELDS,
+    )
+    return {
+        "metrics": metrics,
+        "evidence_mix": [{"label": label, "n": labels.get(label, 0)} for label in LABEL_ORDER],
+        "event_mix": db.query("SELECT event_type AS label,count(*) AS n FROM events WHERE state='active' GROUP BY event_type ORDER BY n DESC,event_type"),
+        "usage_days": [{"day": day, "n": requests.get(day, 0)} for day in days],
+        "usage_today": usage_summary(),
+        "products": products,
+        "compare_query": urlencode([("id", item["id"]) for item in products[:3]]) if len(products) > 1 else "",
+        "dimension_total": len(COMPARE_FIELDS),
+        "recent_tasks": db.query("SELECT x.id,x.kind,x.status,x.created_at,t.title AS topic_title FROM tasks x LEFT JOIN topics t ON t.id=x.topic_id ORDER BY x.id DESC LIMIT 5"),
+    }
 
 
 def register(app, page, form_data, redirect, required, text):
@@ -240,11 +284,13 @@ def register(app, page, form_data, redirect, required, text):
         if q:
             where.append("(c.statement LIKE ? OR d.title LIKE ? OR d.url LIKE ?)")
             args.extend(["%" + q[:100] + "%"] * 3)
+        search = ("WHERE " + " AND ".join(where) if where else "", tuple(args))
         if label:
             where.append("c.label=?")
             args.append(label)
         claims = db.query("SELECT c.*,d.title AS document_title,d.url,d.published_at,d.last_fetched_at,d.extent FROM claims c JOIN documents d ON d.id=c.document_id " + ("WHERE " + " AND ".join(where) if where else "") + " ORDER BY c.id DESC LIMIT 150", tuple(args))
-        return page(request, "evidence.html", title="证据管理", claims=claims, documents=db.query("SELECT * FROM documents ORDER BY id DESC LIMIT 30"), q=q, label=label, labels=sorted(station.LABELS))
+        label_counts = {row["label"]: row["n"] for row in db.query("SELECT c.label,count(*) AS n FROM claims c JOIN documents d ON d.id=c.document_id " + search[0] + " GROUP BY c.label", search[1])}
+        return page(request, "evidence.html", title="证据管理", claims=claims, documents=db.query("SELECT * FROM documents ORDER BY id DESC LIMIT 30"), q=q, label=label, labels=LABEL_ORDER, label_counts=label_counts)
 
     @router.get("/documents/{document_id}", response_class=HTMLResponse)
     def document_page(request: Request, document_id: int):
@@ -279,8 +325,9 @@ def register(app, page, form_data, redirect, required, text):
         if kind:
             condition += " AND kind=?"
             args.append(kind)
-        entities = db.query("SELECT e.*,(SELECT count(*) FROM entity_fields WHERE entity_id=e.id) AS field_count FROM entities e WHERE " + condition + " ORDER BY e.followed DESC,e.kind,e.name LIMIT 200", tuple(args))
-        return page(request, "companies.html", title="厂商与产品", entities=entities, q=q, kind=kind)
+        entities = db.query("SELECT e.*,(SELECT count(*) FROM entity_fields WHERE entity_id=e.id) AS field_count,(SELECT group_concat(DISTINCT field_name) FROM entity_fields WHERE entity_id=e.id) AS field_names FROM entities e WHERE " + condition + " ORDER BY e.followed DESC,e.kind,e.name LIMIT 200", tuple(args))
+        kind_counts = {row["kind"]: row["n"] for row in db.query("SELECT kind,count(*) AS n FROM entities WHERE name LIKE ? AND state!='archived' GROUP BY kind", (args[0],))}
+        return page(request, "companies.html", title="厂商与产品", entities=entities, q=q, kind=kind, kinds_order=("厂商", "产品", "应用场景", "技术路线", "软件生态"), kind_counts=kind_counts)
 
     @router.get("/entities/{entity_id}", response_class=HTMLResponse)
     def entity_page(request: Request, entity_id: int):
@@ -289,7 +336,7 @@ def register(app, page, form_data, redirect, required, text):
         relations = db.query("SELECT r.*,a.name AS source_name,b.name AS target_name,CASE WHEN r.from_entity_id=? THEN b.id ELSE a.id END AS other_id,c.label,d.url FROM relations r JOIN entities a ON a.id=r.from_entity_id JOIN entities b ON b.id=r.to_entity_id LEFT JOIN claims c ON c.id=r.claim_id LEFT JOIN documents d ON d.id=c.document_id WHERE r.from_entity_id=? OR r.to_entity_id=? ORDER BY r.id DESC", (entity_id, entity_id, entity_id))
         events = db.query("SELECT e.* FROM event_entities ee JOIN events e ON e.id=ee.event_id WHERE ee.entity_id=? AND e.state='active' ORDER BY e.id DESC LIMIT 20", (entity_id,))
         products = db.query("SELECT * FROM entities WHERE parent_id=? AND state!='archived' ORDER BY name", (entity_id,))
-        return page(request, "entity.html", title=item["name"], item=item, fields=fields, relations=relations, events=events, products=products)
+        return page(request, "entity.html", title=item["name"], item=item, fields=fields, relations=relations, events=events, products=products, dimensions=COMPARE_FIELDS)
 
     @router.post("/entities/{entity_id}/follow")
     def follow_entity(entity_id: int, form=Depends(form_data)):
@@ -313,8 +360,7 @@ def register(app, page, form_data, redirect, required, text):
         selected = rows_by_ids("entities", ids)
         fields = db.query("SELECT f.*,c.label,d.url FROM entity_fields f LEFT JOIN claims c ON c.id=f.claim_id LEFT JOIN documents d ON d.id=c.document_id WHERE f.entity_id IN (" + ",".join("?" for _ in ids) + ")", tuple(ids)) if ids else []
         by_product = {(item["entity_id"], item["field_name"]): item for item in fields}
-        names = ["业务定位", "模型覆盖", "性能", "功耗成本", "软件迁移", "测试条件", "收费"]
-        rows = [{"name": name, "values": [by_product.get((product["id"], name)) for product in selected]} for name in names]
+        rows = [{"name": name, "values": [by_product.get((product["id"], name)) for product in selected]} for name in COMPARE_FIELDS]
         conditions = [station.normalized(by_product[(product["id"], "测试条件")]["value"]) for product in selected if (product["id"], "测试条件") in by_product]
         comparable = len(selected) > 1 and len(conditions) == len(selected) and len(set(conditions)) == 1
         return page(request, "compare.html", title="产品对比", products=products, selected=selected, rows=rows, comparable=comparable, error_message="")
