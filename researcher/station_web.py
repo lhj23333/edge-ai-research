@@ -3,7 +3,7 @@ from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from . import db, station
 from .config import get_profile, settings
@@ -66,7 +66,12 @@ def home_context():
     latest_revision = db.one("SELECT result_json FROM tasks WHERE kind='revise' AND status='success' AND finished_at>? ORDER BY id DESC LIMIT 1", (issue["created_at"] if issue else day_start,))
     if latest_revision:
         next_questions = list(dict.fromkeys(station.decode(latest_revision["result_json"]).get("questions", []) + next_questions))
-    return {"station": state, "issue": issue, "events": [item for item in events if not item["background"] and item["state"] == "active"][:5], "background_events": [item for item in events if item["background"] and item["state"] == "active"][:5], "revisions": revisions, "progress": progress, "next_questions": next_questions, "catchup_events": catchup_events, "catchup_revisions": catchup_revisions, "task_count": db.one("SELECT count(*) AS n FROM tasks WHERE status IN ('queued','running')")["n"], **dashboard_context()}
+    study = db.one("SELECT t.session_id,t.result_json FROM collection_runs r JOIN tasks t ON t.id=r.task_id WHERE r.id=? AND t.status='success'", (issue["run_id"],)) if issue else None
+    study_points = station.decode(study["result_json"]).get("points", [])[:3] if study else []
+    for point in study_points:
+        identifiers = point.get("claim_ids", [])
+        point["sources"] = db.query("SELECT DISTINCT d.id,d.title,d.url,c.version_id,c.id AS chunk_id FROM claims cl JOIN documents d ON d.id=cl.document_id JOIN claim_evidence ce ON ce.claim_id=cl.id JOIN document_chunks c ON c.id=ce.chunk_id WHERE cl.id IN (" + ",".join("?" for _ in identifiers) + ") LIMIT 4", tuple(identifiers)) if identifiers else []
+    return {"station": state, "issue": issue, "study_points": study_points, "study_session_id": study["session_id"] if study else None, "events": [item for item in events if not item["background"] and item["state"] == "active"][:5], "background_events": [item for item in events if item["background"] and item["state"] == "active"][:5], "revisions": revisions, "progress": progress, "next_questions": next_questions, "catchup_events": catchup_events, "catchup_revisions": catchup_revisions, "task_count": db.one("SELECT count(*) AS n FROM tasks WHERE status IN ('queued','running')")["n"], **dashboard_context()}
 
 
 def dashboard_context():
@@ -293,11 +298,23 @@ def register(app, page, form_data, redirect, required, text):
         return page(request, "evidence.html", title="证据管理", claims=claims, documents=db.query("SELECT * FROM documents ORDER BY id DESC LIMIT 30"), q=q, label=label, labels=LABEL_ORDER, label_counts=label_counts)
 
     @router.get("/documents/{document_id}", response_class=HTMLResponse)
-    def document_page(request: Request, document_id: int):
+    def document_page(request: Request, document_id: int, version: int = 0):
         document = required("SELECT * FROM documents WHERE id=?", (document_id,))
+        selected = required("SELECT * FROM document_versions WHERE id=? AND document_id=?", (version, document_id)) if version else db.one("SELECT * FROM document_versions WHERE document_id=? ORDER BY CASE WHEN extent LIKE '%原文%' THEN 0 ELSE 1 END,id DESC LIMIT 1", (document_id,))
+        if selected:
+            document.update(content=selected["content"], extent=selected["extent"], verification=selected["verification"], last_fetched_at=selected["fetched_at"])
         versions = db.query("SELECT id,extent,fetched_at,verification,content_hash FROM document_versions WHERE document_id=? ORDER BY id DESC", (document_id,))
         claims = db.query("SELECT c.*,d.title AS document_title,d.url,d.published_at,d.last_fetched_at,d.extent FROM claims c JOIN documents d ON d.id=c.document_id WHERE c.document_id=? ORDER BY c.id DESC", (document_id,))
-        return page(request, "document.html", title=document["title"], document=document, versions=versions, claims=claims)
+        chunks = db.query("SELECT * FROM document_chunks WHERE version_id=? ORDER BY position", (selected["id"],)) if selected else []
+        checks = db.query("SELECT ce.*,c.statement,dc.version_id FROM claim_evidence ce JOIN claims c ON c.id=ce.claim_id JOIN document_chunks dc ON dc.id=ce.chunk_id WHERE c.document_id=? ORDER BY ce.created_at DESC", (document_id,))
+        snapshots = db.query("SELECT id,version_id,content_type,method,length(body) AS bytes,created_at FROM source_snapshots WHERE version_id IN (SELECT id FROM document_versions WHERE document_id=?) ORDER BY id DESC", (document_id,))
+        return page(request, "document.html", title=document["title"], document=document, versions=versions, claims=claims, chunks=chunks, selected_version=selected["id"] if selected else None, evidence_checks=checks, snapshots=snapshots)
+
+    @router.get("/documents/{document_id}/snapshots/{snapshot_id}")
+    def download_snapshot(document_id: int, snapshot_id: int):
+        snapshot = required("SELECT s.* FROM source_snapshots s JOIN document_versions v ON v.id=s.version_id WHERE s.id=? AND v.document_id=?", (snapshot_id, document_id))
+        extension = "pdf" if "pdf" in snapshot["content_type"] else "html" if "html" in snapshot["content_type"] else "json" if "json" in snapshot["content_type"] else "txt"
+        return Response(snapshot["body"], media_type=snapshot["content_type"], headers={"Content-Disposition": f'attachment; filename="source-{document_id}-v{snapshot["version_id"]}.{extension}"'})
 
     @router.post("/claims/{claim_id}/verify")
     def verify_claim(claim_id: int, form=Depends(form_data)):
@@ -307,6 +324,9 @@ def register(app, page, form_data, redirect, required, text):
             return redirect(f"/documents/{claim['document_id']}", error="核验状态无效")
         verified_at = db.now() if choice != "待核实" else None
         db.execute("UPDATE claims SET verification=?,verified_at=? WHERE id=?", (choice, verified_at, claim_id))
+        if choice == "人工核对发现不符":
+            from .knowledge import invalidate
+            invalidate(claim["document_id"], "人工核对发现原文与既有说法不符")
         if choice == "人工核对原网页摘录":
             db.execute("UPDATE documents SET verification='至少一条摘录已人工核对',verified_at=? WHERE id=?", (verified_at, claim["document_id"]))
             db.execute("UPDATE document_versions SET verification='至少一条摘录已人工核对',verified_at=? WHERE id=?", (verified_at, claim["document_version_id"]))

@@ -36,9 +36,14 @@ def tick():
     station = db.one("SELECT * FROM station_settings WHERE id=1")
     if station and station["auto_enabled"] and station["next_run"] and station["next_run"] <= db.now():
         try:
-            enqueue_station("scan", schedule_key="station:" + station["next_run"])
+            enqueue_station("scan", schedule_key="station:" + station["next_run"], automatic=True)
         except ValueError as error:
             db.execute("INSERT INTO runtime(name,value) VALUES('scheduler_error',?) ON CONFLICT(name) DO UPDATE SET value=excluded.value", (str(error),))
             return
         following = next_run("daily", station["schedule_time"], 0, settings()["limits"]["timezone"])
         db.execute("UPDATE station_settings SET next_run=? WHERE id=1", (following,))
+    from .research import schedule_followups
+    try:
+        schedule_followups()
+    except ValueError as error:
+        db.execute("INSERT INTO runtime(name,value) VALUES('scheduler_error',?) ON CONFLICT(name) DO UPDATE SET value=excluded.value", (str(error),))

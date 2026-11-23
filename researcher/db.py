@@ -6,7 +6,7 @@ from pathlib import Path
 
 from .config import DATA, config_lock, prepare_data
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 6
 
 
 def now():
@@ -50,6 +50,17 @@ def initialize():
         if version < 3:
             script = (Path(__file__).parent / "migrations/003_event_merge.sql").read_text()
             connection.executescript("BEGIN IMMEDIATE;\n" + script + "\nPRAGMA user_version=3;\nCOMMIT;")
+        if version < 4:
+            script = (Path(__file__).parent / "migrations/004_research.sql").read_text()
+            connection.executescript("BEGIN IMMEDIATE;\n" + script + "\nPRAGMA user_version=4;\nCOMMIT;")
+        if version < 5:
+            script = (Path(__file__).parent / "migrations/005_source_processing.sql").read_text()
+            connection.executescript("BEGIN IMMEDIATE;\n" + script + "\nPRAGMA user_version=5;\nCOMMIT;")
+        if version < 6:
+            script = (Path(__file__).parent / "migrations/006_continuity.sql").read_text()
+            connection.executescript("PRAGMA foreign_keys=OFF;\nBEGIN IMMEDIATE;\n" + script + "\nPRAGMA user_version=6;\nCOMMIT;\nPRAGMA foreign_keys=ON;")
+            if connection.execute("PRAGMA foreign_key_check").fetchone():
+                raise RuntimeError("研究历史迁移后的数据库关联检查未通过")
     os.chmod(DATA / "researcher.sqlite3", 0o600)
 
 

@@ -4,10 +4,18 @@ from . import db
 from .config import fingerprint, get_profile, settings
 
 STATES = {"queued": "排队中", "running": "正在研究", "success": "已完成", "failed": "执行失败", "cancelled": "已取消", "interrupted": "已中断"}
-KINDS = {"research": "历史联网研究", "chat": "历史讨论", "summary": "整理成果", "test_chat": "连接测试", "test_search": "联网测试", "onboard": "提出关注名单", "scan": "行业采集与认知更新", "question": "定向研究", "revise": "根据已有证据修订专题"}
+KINDS = {"research": "历史联网研究", "chat": "历史讨论", "summary": "整理成果", "test_chat": "连接测试", "test_search": "联网测试", "onboard": "提出关注名单", "scan": "行业采集与认知更新", "question": "定向研究", "revise": "根据已有证据修订专题", "interactive": "探索研究", "followup": "后续问题研究"}
+KINDS["test_tools"] = "研究工具调用测试"
 
 
 def enqueue(topic_id, kind, prompt="", brief_id=None, profile_id=None, schedule_key=None):
+    if topic_id and kind in {"chat", "summary", "research"}:
+        from .research import enqueue as enqueue_research
+        topic = db.one("SELECT title,question FROM topics WHERE id=?", (topic_id,))
+        if not topic:
+            raise ValueError("研究主题不存在")
+        goal = prompt if kind == "chat" else f"检查专题“{topic['title']}”的变化及尚未解决的问题：{topic['question']}。复用已有资料，只调查缺少的依据和需要检查的变化。" if kind == "research" else None
+        return enqueue_research("revise" if kind == "summary" else "interactive", {"target_kind": "topic", "target_id": topic_id, "topic_id": topic_id, **({"main_question": goal} if goal else {})}, schedule_key, automatic=bool(schedule_key), profile_id=profile_id)
     profile = get_profile(profile_id)
     if kind in ("research", "test_search") and profile.provider == "compatible":
         raise ValueError("该配置仅支持已有资料讨论，请选择其他服务商执行联网研究")
@@ -53,7 +61,9 @@ def context(topic_id, brief_id=None):
 
 def save_artifact(topic_id, title, body, origin_task=None):
     with db.transaction() as connection:
-        previous = connection.execute("SELECT id,version FROM artifacts WHERE topic_id=? ORDER BY id DESC LIMIT 1", (topic_id,)).fetchone()
+        previous = connection.execute("SELECT id,version,title,body FROM artifacts WHERE topic_id=? ORDER BY id DESC LIMIT 1", (topic_id,)).fetchone()
+        if previous and previous["title"] == title and previous["body"] == body:
+            return previous["id"]
         cursor = connection.execute("INSERT INTO artifacts(topic_id,title,body,version,parent_id,origin_task,created_at) VALUES(?,?,?,?,?,?,?)", (topic_id, title, body, previous["version"] + 1 if previous else 1, previous["id"] if previous else None, origin_task, db.now()))
         return cursor.lastrowid
 

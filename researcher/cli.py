@@ -3,6 +3,7 @@ import fcntl
 import json
 import os
 import signal
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -13,7 +14,7 @@ from contextlib import ExitStack
 from pathlib import Path
 
 from . import db
-from .config import DATA, ROOT, Limits, Profile, config_lock, prepare_data, read_json, write_json
+from .config import DATA, ROOT, Limits, Profile, ResearchSettings, config_lock, prepare_data, read_json, write_json
 
 
 def lock_file(name):
@@ -97,21 +98,23 @@ def restore(source, replace=False):
         if destination.exists() and not replace:
             raise SystemExit("数据目录已有数据库；确认替换时请使用 --replace，并先备份")
         with zipfile.ZipFile(source) as archive:
-            if sum(info.file_size for info in archive.infolist()) > 512_000_000:
-                raise SystemExit("备份超过 512 MB 的恢复限制")
+            if sum(info.file_size for info in archive.infolist()) > 8_000_000_000:
+                raise SystemExit("备份超过 8 GB 的恢复限制")
             manifest = json.loads(archive.read("manifest.json"))
             if manifest["version"] not in (1, 2):
                 raise SystemExit("备份版本不受支持")
-            contents = archive.read("researcher.sqlite3")
+            snapshot_path = staging / "researcher.sqlite3"
+            with archive.open("researcher.sqlite3") as source_file, snapshot_path.open("wb") as output_file:
+                shutil.copyfileobj(source_file, output_file)
             config = json.loads(archive.read("config.json"))
             Limits(**config.get("limits", {}))
+            ResearchSettings(**config.get("research", {}))
             for item in config.get("profiles", []):
                 Profile(**item)
                 item["chat_verified"] = None
                 item["search_verified"] = None
+                item["tools_verified"] = None
             keys = json.loads(archive.read("secrets.json")) if manifest.get("includes_secrets") else None
-        snapshot_path = staging / "researcher.sqlite3"
-        snapshot_path.write_bytes(contents)
         snapshot = sqlite3.connect(snapshot_path)
         try:
             version = snapshot.execute("PRAGMA user_version").fetchone()[0]
@@ -123,6 +126,9 @@ def restore(source, replace=False):
             snapshot.execute("UPDATE topics SET schedule='manual',next_run=NULL")
             if version >= 2:
                 snapshot.execute("UPDATE station_settings SET auto_enabled=0,next_run=NULL,last_status='never',last_error='' WHERE id=1")
+            if version >= 4:
+                snapshot.execute("UPDATE research_sessions SET status='interrupted' WHERE status='running'")
+                snapshot.execute("UPDATE research_gaps SET status='deferred' WHERE status='running'")
             snapshot.execute("DELETE FROM runtime")
             snapshot.commit()
             target = sqlite3.connect(destination)
@@ -180,6 +186,10 @@ def main():
         sub.add_argument("--port", type=int, default=8765)
     commands.add_parser("worker")
     commands.add_parser("check")
+    commands.add_parser("prepare-models")
+    commands.add_parser("consolidate-history")
+    sub = commands.add_parser("index")
+    sub.add_argument("--rebuild", action="store_true")
     sub = commands.add_parser("backup")
     sub.add_argument("destination")
     sub.add_argument("--include-secrets", action="store_true")
@@ -208,6 +218,18 @@ def main():
         print(f"数据库完整性：{result}；版本：{version}；数据目录：{DATA}")
         if result != "ok":
             raise SystemExit(1)
+    elif arguments.command == "prepare-models":
+        from .knowledge import prepare_models
+        print(prepare_models())
+    elif arguments.command == "consolidate-history":
+        from .continuity import consolidate_history
+        with lock_file("worker.lock"), lock_file("web.lock"):
+            db.initialize()
+            print(consolidate_history())
+    elif arguments.command == "index":
+        from .knowledge import ensure_index
+        db.initialize()
+        print(ensure_index(rebuild=arguments.rebuild))
 
 
 if __name__ == "__main__":

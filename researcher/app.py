@@ -73,6 +73,7 @@ NAVIGATION = (
         {"href": "/evidence", "label": "证据管理", "icon": "evidence", "match": ("/evidence", "/documents")},
     )},
     {"label": "Research", "links": (
+        {"href": "/research", "label": "探索研究", "icon": "search", "match": ("/research",)},
         {"href": "/questions", "label": "定向研究", "icon": "target", "match": ("/questions",)},
         {"href": "/personal", "label": "个人区域", "icon": "note", "match": ("/personal", "/annotations"), "children": (
             {"href": "/library", "label": "成果库", "match": ("/library", "/artifacts")},
@@ -369,10 +370,15 @@ async def task_events(request: Request, task_id: int):
 
 @app.post("/tasks/{task_id}/cancel")
 def cancel_task(task_id: int, form=Depends(form_data)):
-    required("SELECT id FROM tasks WHERE id=?", (task_id,))
+    task = required("SELECT * FROM tasks WHERE id=?", (task_id,))
     with db.transaction() as connection:
         connection.execute("UPDATE tasks SET cancel_requested=1 WHERE id=? AND status IN ('queued','running')", (task_id,))
         connection.execute("UPDATE tasks SET status='cancelled',progress='已取消',finished_at=? WHERE id=? AND status='queued'", (db.now(), task_id))
+        if task["status"] == "queued" and task["session_id"]:
+            connection.execute("UPDATE research_sessions SET status='cancelled',updated_at=? WHERE id=?", (db.now(), task["session_id"]))
+    if task["status"] == "queued" and task["session_id"]:
+        from .research import finish_gap
+        finish_gap(task, False)
     return redirect(f"/tasks/{task_id}", "已提交取消请求")
 
 
@@ -414,7 +420,7 @@ def active_profile(form=Depends(form_data)):
 def test_profile(form=Depends(form_data)):
     try:
         mode = str(form.get("mode"))
-        if mode not in ("test_chat", "test_search"):
+        if mode not in ("test_chat", "test_search", "test_tools"):
             raise ValueError("测试类型无效")
         task_id = enqueue(None, mode, profile_id=str(form.get("profile_id")))
         return redirect(f"/tasks/{task_id}")
@@ -444,3 +450,7 @@ def health():
 from .station_web import register
 
 register(app, page, form_data, redirect, required, text)
+
+from .research_web import register as register_research
+
+register_research(app, page, form_data, redirect, required, text)

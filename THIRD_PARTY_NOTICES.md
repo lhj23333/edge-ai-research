@@ -32,3 +32,22 @@ OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 - 许可证：SIL Open Font License 1.1
 - 原文：https://github.com/JetBrains/JetBrainsMono/blob/master/OFL.txt
 - 来源：https://cdn.jsdelivr.net/fontsource/fonts/jetbrains-mono@5.2.8/
+
+## 研究与检索依赖
+
+- LangGraph、LangChain Text Splitters：MIT，https://github.com/langchain-ai/langgraph 、https://github.com/langchain-ai/langchain
+- sqlite-vec：MIT / Apache-2.0，https://github.com/asg017/sqlite-vec
+- sentence-transformers：Apache-2.0，https://github.com/huggingface/sentence-transformers
+- BGE-M3 模型：MIT，https://huggingface.co/BAAI/bge-m3
+- bge-reranker-v2-m3 模型：Apache-2.0，https://huggingface.co/BAAI/bge-reranker-v2-m3
+- Trafilatura：Apache-2.0，https://github.com/adbar/trafilatura
+- pypdf：BSD-3-Clause，https://github.com/py-pdf/pypdf
+- jieba：MIT，https://github.com/fxsjy/jieba
+- httpx-sse：MIT，https://github.com/florimondmanca/httpx-sse
+
+Python 依赖通过 requirements.lock 安装。检索模型下载到运行数据目录，用于本机推理。
+
+## 调研去重设计参考
+
+- GPT Researcher：共享已访问来源，https://github.com/assafelovic/gpt-researcher/blob/3582a6841fe7dc801e2a34e34ee408641aea9bce/gpt_researcher/skills/researcher.py
+- Graphiti：相同事实、冲突和时间变化的判定，https://github.com/getzep/graphiti/blob/fb60e59d4a208c99e7d0186ee6335d2a257f17f2/graphiti_core/prompts/dedupe_edges.py

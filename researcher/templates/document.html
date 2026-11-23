@@ -24,19 +24,22 @@
       <div class="panel-head"><h2>{{ icon('database') }}获取内容</h2><span class="meta"><span class="badge">{{ document.extent }}</span><span class="badge tone-{{ document.verification|tone }}">{{ document.verification }}</span></span></div>
       <p class="source-url mono">{{ document.url }}</p>
       <pre class="source-content">{{ document.content }}</pre>
+      {% if chunks %}<details><summary>查看带编号的原文片段</summary>{% for chunk in chunks %}<section id="chunk-{{ chunk.id }}"><p class="meta">原文片段 {{ chunk.id }}{% if chunk.page %} · 第 {{ chunk.page }} 页{% endif %} · 字符 {{ chunk.start_offset }}—{{ chunk.end_offset }}</p><pre class="source-content">{{ chunk.content }}</pre></section>{% endfor %}</details>{% endif %}
     </section>
     <section class="panel">
       <div class="panel-head"><h2>{{ icon('evidence') }}关联说法与核验</h2><span class="panel-note mono">{{ claims|length }} 条</span></div>
       {{ evidence_cards(claims) }}
     </section>
+    {% if evidence_checks %}<section class="panel"><div class="panel-head"><h2>{{ icon('shield') }}模型对原文支持程度的核验</h2></div><p class="panel-note">下列结果来自模型核验，人工核验状态见关联说法。</p><div class="list">{% for check in evidence_checks %}<article class="list-item"><strong>{{ check.statement }}</strong><p>{{ check.reason }}</p><small>{{ {'supported':'原文支持','partial':'部分支持','contradicted':'原文存在矛盾','insufficient':'依据不足'}.get(check.verdict,check.verdict) }} · <a href="/documents/{{ document.id }}?version={{ check.version_id }}#chunk-{{ check.chunk_id }}">片段 {{ check.chunk_id }} · 版本 {{ check.version_id }}</a></small></article>{% endfor %}</div></section>{% endif %}
   </div>
   <aside class="panel">
     <div class="panel-head"><h2>{{ icon('layers') }}资料版本</h2><span class="panel-note mono">{{ versions|length }}</span></div>
     {% if versions %}
     <ol class="timeline">
-      {% for version in versions %}<li class="timeline-item"><strong class="mono">{{ version.fetched_at|localtime }}</strong><small>{{ version.extent }} · {{ version.verification }}</small></li>{% endfor %}
+      {% for version in versions %}<li class="timeline-item"><a href="/documents/{{ document.id }}?version={{ version.id }}"><strong class="mono">{{ version.fetched_at|localtime }}</strong></a><small>{{ version.extent }} · {{ version.verification }}{{ ' · 当前阅读' if selected_version==version.id else '' }}</small></li>{% endfor %}
     </ol>
     {% else %}<p class="muted">尚无版本记录。</p>{% endif %}
+    {% if snapshots %}<h3 class="subhead">保存的原始资料</h3><div class="list">{% for snapshot in snapshots %}<a class="list-item" href="/documents/{{ document.id }}/snapshots/{{ snapshot.id }}"><strong>下载版本 {{ snapshot.version_id }} 的快照</strong><small>{{ snapshot.content_type }} · {{ snapshot.bytes }} 字节 · {{ snapshot.created_at|localtime }}</small></a>{% endfor %}</div>{% endif %}
   </aside>
 </div>
 {% endblock %}

@@ -56,6 +56,10 @@ def store_sources(connection, task_id, sources):
 
 
 async def perform(task):
+    if task.get("session_id"):
+        from .research_engine import perform as perform_research
+        await perform_research(task)
+        return
     if task["kind"] in {"onboard", "scan", "question", "revise"}:
         from .pipeline import perform as perform_station
         await perform_station(task)
@@ -66,9 +70,17 @@ async def perform(task):
     gateway = Gateway(profile, task["id"])
     gateway.checkpoint("正在连接云端服务")
     mode = task["kind"]
-    if mode in ("test_chat", "test_search"):
+    if mode in ("test_chat", "test_search", "test_tools"):
         if mode == "test_chat":
             reply = await gateway.complete([{"role": "user", "content": "请用中文简短回复连接成功。"}], max_tokens=512)
+        elif mode == "test_tools":
+            from .research_models import Finish
+            reply = await gateway.complete([{"role": "user", "content": "请调用 finish_research，reason 填写工具调用验证完成，complete 为 true，needs_input 留空。"}], tools=[{"type": "function", "function": {"name": "finish_research", "description": "提交工具调用测试结果", "parameters": Finish.model_json_schema()}}], reasoning_effort="low", max_tokens=2048, operation="test_tools")
+            calls = reply.message.get("tool_calls") or []
+            if len(calls) != 1 or calls[0]["function"]["name"] != "finish_research":
+                raise ResearchError("模型未返回有效的原生工具调用")
+            Finish.model_validate_json(calls[0]["function"]["arguments"])
+            reply.text = "原生工具调用与思考模式已通过实际请求验证。"
         else:
             from datetime import date
             question = f"查询独立 AI 加速器领域一项可核实的近期产品或软件进展，用 200 字以内简要回答并给出来源链接。当前日期：{date.today()}。"
@@ -76,7 +88,7 @@ async def perform(task):
             if not reply.sources:
                 raise ResearchError("联网测试未取得来源，不能确认该模型可执行联网研究")
         gateway.checkpoint()
-        mark_verified(profile, "chat" if mode == "test_chat" else "search", db.now(), task["profile_fingerprint"])
+        mark_verified(profile, {"test_chat": "chat", "test_search": "search", "test_tools": "tools"}[mode], db.now(), task["profile_fingerprint"])
         if mode == "test_search":
             mark_verified(profile, "chat", db.now(), task["profile_fingerprint"])
         with db.transaction() as connection:
@@ -148,6 +160,7 @@ def finish_interrupted_run(task_id, reason):
 
 
 async def run_task(task):
+    from .research_engine import YieldResearch
     operation = asyncio.create_task(perform(task))
     try:
         while not operation.done():
@@ -159,6 +172,8 @@ async def run_task(task):
                 raise Cancelled("任务已取消，已发出的服务商请求仍可能产生费用")
             db.execute("UPDATE tasks SET heartbeat=? WHERE id=?", (db.now(), task["id"]))
         await operation
+    except YieldResearch:
+        db.execute("UPDATE tasks SET status='queued',progress='已保存进度，等待手动研究完成后继续' WHERE id=?", (task["id"],))
     except Cancelled as error:
         finish_interrupted_run(task["id"], str(error))
         db.execute("UPDATE tasks SET status='cancelled',error=?,progress='已取消',finished_at=? WHERE id=?", (str(error), db.now(), task["id"]))
@@ -170,11 +185,21 @@ async def run_task(task):
         raise
     except Exception as error:
         message = str(error) if isinstance(error, (ResearchError, ValueError)) and not isinstance(error, ValidationError) else f"研究处理失败（{type(error).__name__}），结果未保存，请检查配置或运行日志"
+        if isinstance(error, ValidationError):
+            fields = ", ".join(".".join(str(part) for part in item["loc"]) + ":" + item["type"] for item in error.errors()[:5])
+            message = "结构化研究结果未通过校验：" + fields + "；原文和实际返回内容已保留"
         logger.error("任务 %s 执行失败，错误类型 %s", task["id"], type(error).__name__)
         finish_interrupted_run(task["id"], message)
         db.execute("UPDATE tasks SET status='failed',error=?,progress='执行失败',finished_at=? WHERE id=?", (message, db.now(), task["id"]))
         if task["kind"] == "question":
             db.execute("UPDATE research_questions SET status='failed',updated_at=? WHERE task_id=?", (db.now(), task["id"]))
+    finally:
+        if task.get("session_id"):
+            current = db.one("SELECT status FROM tasks WHERE id=?", (task["id"],))
+            if current and current["status"] in {"failed", "cancelled", "interrupted"}:
+                db.execute("UPDATE research_sessions SET status=?,updated_at=? WHERE id=?", (current["status"], db.now(), task["session_id"]))
+                from .research import finish_gap
+                finish_gap(task, False)
 
 
 async def heartbeat():
@@ -184,7 +209,14 @@ async def heartbeat():
 
 
 async def loop():
+    db.execute("UPDATE research_cache SET status='unknown' WHERE status='running'")
+    interrupted = db.query("SELECT * FROM tasks WHERE status='running'")
     db.execute("UPDATE tasks SET status='interrupted',error='后台服务曾停止，任务没有自动重试',finished_at=? WHERE status='running'", (db.now(),))
+    for task in interrupted:
+        if task.get("session_id"):
+            from .research import finish_gap
+            db.execute("UPDATE research_sessions SET status='interrupted',updated_at=? WHERE id=?", (db.now(), task["session_id"]))
+            finish_gap(task, False)
     for run in db.query("SELECT id,task_id FROM collection_runs WHERE status='running'"):
         finish_interrupted_run(run["task_id"], "后台服务曾停止，采集未完成")
     db.execute("UPDATE usage SET status='interrupted' WHERE status='reserved'")
@@ -198,9 +230,9 @@ async def loop():
         while not stop.is_set():
             tick()
             with db.transaction() as connection:
-                task = connection.execute("SELECT * FROM tasks WHERE status='queued' ORDER BY id LIMIT 1").fetchone()
+                task = connection.execute("SELECT * FROM tasks WHERE status='queued' ORDER BY priority DESC,id LIMIT 1").fetchone()
                 if task:
-                    connection.execute("UPDATE tasks SET status='running',started_at=?,heartbeat=? WHERE id=?", (db.now(), db.now(), task["id"]))
+                    connection.execute("UPDATE tasks SET status='running',started_at=coalesce(started_at,?),heartbeat=? WHERE id=?", (db.now(), db.now(), task["id"]))
                     task = dict(task)
             if task:
                 running = asyncio.create_task(run_task(task))

@@ -9,7 +9,7 @@
 </div>
 <label>API 基础地址<input class="mono" type="url" name="base_url" value="{{ profile.base_url if profile else presets.qwen.base_url }}" required maxlength="500" placeholder="https://…"></label>
 <label>模型或推理接入点名称<input class="mono" name="model" value="{{ profile.model if profile else presets.qwen.model }}" required maxlength="120" placeholder="填写账户中已开通的模型名称"></label>
-<label>DeepSeek 开放式回答的思考强度<select name="reasoning_effort">{% for value,label in [('low','低（默认）'),('high','高'),('max','最高'),('disabled','关闭思考'),('default','服务商默认')] %}<option value="{{ value }}" {{ 'selected' if (profile.reasoning_effort if profile else 'low')==value else '' }}>{{ label }}</option>{% endfor %}</select><small>此选项仅用于 DeepSeek。结构化名单、事件和判断修订使用非思考模式控制输出额度，并校验结果完整性；开放式回答使用这里的强度。</small></label>
+<label>DeepSeek 一般回答的思考强度<select name="reasoning_effort">{% for value,label in [('low','低（默认）'),('high','高'),('max','最高'),('disabled','关闭思考'),('default','服务商默认')] %}<option value="{{ value }}" {{ 'selected' if (profile.reasoning_effort if profile else 'low')==value else '' }}>{{ label }}</option>{% endfor %}</select><small>探索研究的规划、综合和证据核验分别使用下方研究设置中的强度。</small></label>
 <label>API 密钥{% if profile %}<small>留空保留已有密钥</small>{% endif %}<input type="password" name="api_key" autocomplete="new-password" maxlength="2000" {{ 'required' if not profile else '' }} placeholder="仅保存在本机服务端"></label>
 <details><summary>token 费用估算（可选）</summary><p class="muted">以人民币填写每百万 token 的单价。仅估算已返回的 token 用量，搜索及其他工具费用另计。</p><div class="field-row"><label>输入单价 / 百万 token<input name="input_price" type="number" step="any" min="0" value="{{ profile.input_price if profile and profile.input_price is not none else '' }}"></label><label>输出单价 / 百万 token<input name="output_price" type="number" step="any" min="0" value="{{ profile.output_price if profile and profile.output_price is not none else '' }}"></label></div><label>价格来源及确认日期<input name="price_note" maxlength="300" value="{{ profile.price_note if profile else '' }}" placeholder="服务商价格页链接、确认日期"></label></details>
 <div class="form-actions"><button type="submit" class="button primary">{{ icon('check') }}保存模型配置</button></div>
@@ -32,10 +32,11 @@
           <div class="verification-row">
             <span class="verification tone-{{ 'success' if profile.chat_verified else 'neutral' }}">{{ icon('check-circle' if profile.chat_verified else 'clock') }}{{ '连接已验证' if profile.chat_verified else '连接尚未验证' }}</span>
             <span class="verification tone-{{ 'success' if profile.search_verified else 'neutral' }}">{{ icon('check-circle' if profile.search_verified else 'clock') }}{{ '联网已验证' if profile.search_verified else '联网尚未验证' }}</span>
+            <span class="verification tone-{{ 'success' if profile.tools_verified else 'neutral' }}">{{ icon('check-circle' if profile.tools_verified else 'clock') }}{{ '研究工具调用已验证' if profile.tools_verified else '研究工具调用尚未验证' }}</span>
             {% if profile.search_verified %}<small class="muted">联网验证时间：<span class="mono">{{ profile.search_verified|localtime }}</span></small>{% endif %}
           </div>
           <p class="muted">{{ presets[profile.provider].search }}</p>
-          <div class="actions">{% for mode,label,symbol in [('test_chat','测试连接','link'),('test_search','测试联网研究','search')] %}<form action="/settings/test" method="post">{{ token() }}<input type="hidden" name="profile_id" value="{{ profile.id }}"><input type="hidden" name="mode" value="{{ mode }}"><button type="submit" class="button small" {{ 'disabled' if mode=='test_search' and profile.provider=='compatible' else '' }}>{{ icon(symbol) }}{{ label }}</button></form>{% endfor %}</div>
+          <div class="actions">{% for mode,label,symbol in [('test_chat','测试连接','link'),('test_search','测试联网研究','search'),('test_tools','测试研究工具','spark')] %}<form action="/settings/test" method="post">{{ token() }}<input type="hidden" name="profile_id" value="{{ profile.id }}"><input type="hidden" name="mode" value="{{ mode }}"><button type="submit" class="button small" {{ 'disabled' if mode=='test_search' and profile.provider=='compatible' else '' }}>{{ icon(symbol) }}{{ label }}</button></form>{% endfor %}</div>
           <details><summary>编辑配置</summary><form action="/settings/profiles" method="post" class="stack-form">{{ token() }}{{ profile_fields(profile) }}</form></details>
         </article>
         {% else %}
@@ -44,6 +45,21 @@
         <details class="panel compact new-profile" {{ 'open' if not config.profiles else '' }}><summary>{{ icon('plus') }}添加模型配置</summary><form action="/settings/profiles" method="post" class="stack-form">{{ token() }}{{ profile_fields() }}</form></details>
       </div>
       <p class="field-help section-space">测试会实际调用云端 API，并计入调用额度。对话接口兼容不代表具备联网能力，联网测试必须取得来源。</p>
+    </section>
+
+    <section class="panel" id="research">
+      <div class="panel-head"><h2>{{ icon('search') }}研究与知识积累</h2></div>
+      <form action="/settings/research" method="post" class="stack-form section-space">{{ token() }}
+        <div class="field-row">{% for key,label,minimum,maximum in [('scan_requests','今日简报请求上限',4,100),('question_requests','交互与定向研究请求上限',4,100),('revise_requests','知识整理请求上限',3,100),('onboard_requests','候选名单请求上限',4,100),('followup_requests','后续研究请求上限',4,100),('automatic_daily_requests','自动任务每日请求上限',0,10000),('followups_per_day','每日自动后续研究项数',0,20),('max_rounds','每次调查最多轮数',1,30),('timeout_minutes','每次调查最多分钟',1,120),('context_chunks','每轮整理最多原文片段',4,40),('source_fresh_days','已取资料有效天数',1,90),('query_cache_hours','相同查询复用小时数',1,24)] %}<label>{{ label }}<input name="{{ key }}" type="number" min="{{ minimum }}" max="{{ maximum }}" value="{{ config.research[key] }}" required></label>{% endfor %}</div>
+        <p class="field-help">相同范围和条件的查询默认在6小时内复用。选择“检查最新资料”会主动检查来源变化；内容未变化时继续使用已有原文和核验结果。</p>
+        <div class="field-row">{% for key,label in [('planning_effort','规划思考强度'),('review_effort','证据核验思考强度'),('synthesis_effort','综合思考强度')] %}<label>{{ label }}<select name="{{ key }}">{% for value,description in [('disabled','关闭'),('low','低'),('high','高'),('max','最高')] %}<option value="{{ value }}" {{ 'selected' if config.research[key]==value else '' }}>{{ description }}</option>{% endfor %}</select></label>{% endfor %}</div>
+        <div class="field-row">{% for key,label in [('planning_output_tokens','规划输出 token 上限'),('review_output_tokens','核验输出 token 上限'),('synthesis_output_tokens','综合输出 token 上限')] %}<label>{{ label }}<input name="{{ key }}" type="number" min="1024" max="32768" value="{{ config.research[key] }}" required></label>{% endfor %}</div>
+        <p class="field-help">思考模式的输出额度同时包含思考与最终内容。规划、核验和综合分别使用以上上限，实际 token 用量记录在任务中。</p>
+        <details><summary>本地知识检索模型</summary><div class="stack-form"><label>执行设备<input name="device" value="{{ config.research.device }}" pattern="cpu|cuda:[0-9]+" required></label><label>语义检索模型<input name="embedding_model" value="{{ config.research.embedding_model }}" required></label><label>排序模型<input name="reranker_model" value="{{ config.research.reranker_model }}" required></label><p class="field-help">修改模型后运行模型准备和索引重建命令。设备不可用时会显示错误，需要选择有效设备。</p><pre><code>.venv/bin/researcher prepare-models
+.venv/bin/researcher index --rebuild</code></pre></div></details>
+        <p class="field-help">自动研究同时受每日总额度约束。自动更新沿用关注名单页面中的开关；未开启时不推进后续问题。原文、证据和记忆保存在本机。</p>
+        <button class="button primary" type="submit">保存研究设置</button>
+      </form>
     </section>
 
     <section class="panel" id="operation">
@@ -64,8 +80,8 @@ systemctl --user enable --now researcher-web researcher-worker</code></pre>
       <p class="panel-note">所有测试、手动与定时任务共同使用每日额度。每次重试也计为一次请求。</p>
       <form action="/settings/limits" method="post" class="stack-form section-space">{{ token() }}
         <label>每日最多 API 请求<input name="daily_requests" type="number" min="1" max="10000" value="{{ config.limits.daily_requests }}" required></label>
-        <label>每个任务最多 API 请求<input name="task_requests" type="number" min="2" max="100" value="{{ config.limits.task_requests }}" required></label>
-        <label>每次生成最多输出 token<input name="output_tokens" type="number" min="256" max="32768" value="{{ config.limits.output_tokens }}" required></label>
+        <label>历史任务与连接测试请求上限<input name="task_requests" type="number" min="2" max="100" value="{{ config.limits.task_requests }}" required></label>
+        <label>一般回答与连接测试输出 token 上限<input name="output_tokens" type="number" min="256" max="32768" value="{{ config.limits.output_tokens }}" required></label>
         <small class="field-help">时间按 Asia/Shanghai 计算。达到额度后停止新请求；服务商内部工具调用可能另行计费。</small>
         <button class="button" type="submit">{{ icon('check') }}保存调用额度</button>
       </form>

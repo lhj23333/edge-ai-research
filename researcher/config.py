@@ -35,6 +35,31 @@ class Limits(BaseModel):
         return value
 
 
+class ResearchSettings(BaseModel):
+    query_cache_hours: int = Field(default=6, ge=1, le=24)
+    scan_requests: int = Field(default=16, ge=4, le=100)
+    question_requests: int = Field(default=24, ge=4, le=100)
+    revise_requests: int = Field(default=12, ge=3, le=100)
+    onboard_requests: int = Field(default=8, ge=4, le=100)
+    followup_requests: int = Field(default=12, ge=4, le=100)
+    automatic_daily_requests: int = Field(default=36, ge=0, le=10000)
+    followups_per_day: int = Field(default=2, ge=0, le=20)
+    max_rounds: int = Field(default=8, ge=1, le=30)
+    timeout_minutes: int = Field(default=30, ge=1, le=120)
+    context_chunks: int = Field(default=16, ge=4, le=40)
+    max_source_bytes: int = Field(default=20_000_000, ge=100000, le=100_000_000)
+    source_fresh_days: int = Field(default=7, ge=1, le=90)
+    device: str = Field(default="cuda:0", pattern=r"^(cpu|cuda:[0-9]+)$")
+    embedding_model: str = "BAAI/bge-m3"
+    reranker_model: str = "BAAI/bge-reranker-v2-m3"
+    planning_effort: Literal["low", "high", "max", "disabled"] = "high"
+    review_effort: Literal["low", "high", "max", "disabled"] = "high"
+    synthesis_effort: Literal["low", "high", "max", "disabled"] = "disabled"
+    planning_output_tokens: int = Field(default=8192, ge=1024, le=32768)
+    review_output_tokens: int = Field(default=32768, ge=1024, le=32768)
+    synthesis_output_tokens: int = Field(default=8192, ge=1024, le=32768)
+
+
 class Profile(BaseModel):
     id: str = Field(pattern=r"^[a-zA-Z0-9_-]{1,60}$")
     name: str = Field(min_length=1, max_length=80)
@@ -47,6 +72,7 @@ class Profile(BaseModel):
     price_note: str = Field(default="", max_length=300)
     chat_verified: str | None = None
     search_verified: str | None = None
+    tools_verified: str | None = None
 
     @field_validator("provider")
     @classmethod
@@ -103,7 +129,7 @@ def settings():
             profile.chat_verified = None
             profile.search_verified = None
         items.append(profile.model_dump(mode="json"))
-    return {"profiles": items, "active_profile": data.get("active_profile", ""), "limits": Limits(**data.get("limits", {})).model_dump()}
+    return {"profiles": items, "active_profile": data.get("active_profile", ""), "limits": Limits(**data.get("limits", {})).model_dump(), "research": ResearchSettings(**data.get("research", {})).model_dump()}
 
 
 def profiles():
@@ -141,6 +167,7 @@ def save_profile(profile, api_key):
         if not changed and not api_key:
             profile.chat_verified = previous.get("chat_verified")
             profile.search_verified = previous.get("search_verified")
+            profile.tools_verified = previous.get("tools_verified")
         if api_key:
             keys[profile.id] = api_key
         config["profiles"] = [item for item in config["profiles"] if item["id"] != profile.id] + [profile.model_dump(mode="json")]

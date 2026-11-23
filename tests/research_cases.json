@@ -1,0 +1,22 @@
+[
+  {"question":"Hailo-10H 商用后客户如何取得软件并订购产品？","source":"geekpark.net/news/351800"},
+  {"question":"贸泽销售的 NXP Ara240 面向哪些工业和机器人应用？","source":"eepw.com.cn/article/202610/484309"},
+  {"question":"Axelera Metis 与 Voyager SDK 在边缘影像推理中分别起什么作用？","source":"digitimes.com.tw"},
+  {"question":"BrainChip AKD1500 的商业供货与生产出货是什么状态？","source":"brainchip"},
+  {"question":"Mobilint 提供哪些芯片、硬件和软件方案，面向什么部署环境？","source":"nextaikorea.com"},
+  {"question":"NXP Ara240 中文规格资料列出了哪些目标应用？","source":"ARA240DNPUFS.pdf"},
+  {"question":"Google Tensor SDK Beta 通过 LiteRT 支持哪一代 Pixel 设备？","source":"google-tensor-sdk-beta-with-litert"},
+  {"question":"Andes AnDLA I370 v2.0 和 NN SDK v1.2.0 支持哪些边缘模型类别？","source":"andestech.com/cn/2026/08/03"},
+  {"question":"Axelera Europa 的 TOPS 数字、处理核心数和加速卡 TDP 是什么？","source":"axelera-launches-europa"},
+  {"question":"Axera AX8860 的内存容量、PCIe 和 AXLink 互联支持是什么？","source":"pandaily.com/axera"},
+  {"question":"Hailo-10H 的 2.5 瓦与 2B 模型每秒令牌数分别是什么口径？","source":"ai.zhiding.cn/2025/0723"},
+  {"question":"Blaize GSP 的可编程能力和并行处理层次有哪些？","source":"ir.blaize.com/static-files"},
+  {"question":"Gateworks GW16168 M.2 AI 加速卡与 NXP 的合作进展是什么？","source":"gateworks-and-nxp"},
+  {"question":"AKD1500 的事件驱动处理适用于哪些工业与可穿戴系统？","source":"a-chip-that-learns"},
+  {"question":"Ceva NeuPro NPU 如何覆盖 Physical AI 和 AI infrastructure？","source":"semiiphub.com/pulse/news/ceva"},
+  {"question":"Jetson AGX Thor 发布后软件优化如何改变生成式 AI 吞吐量？","source":"zhuanlan.zhihu.com/p/1964736215308832928"},
+  {"question":"Intel 边缘 RAG 的索引、检索、重排序与生成组件有哪些软件优化？","source":"intel.cn/content/dam"},
+  {"question":"Ara240 在边缘运行 Transformer 与多模态生成式 AI 有哪些公开能力说明？","source":"ARA240DNPUFS.pdf"},
+  {"question":"Hailo-10H 与 Hailo-8 的视觉和生成式 AI 工作负载定位有何关系？","source":"m.thepaper.cn/newsDetail_forward_31241062"},
+  {"question":"Europa 加速器已在哪些 Dell 与 Supermicro 系统中提供验证？","source":"axelera-launches-europa"}
+]

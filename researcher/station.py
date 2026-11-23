@@ -27,39 +27,9 @@ def normalized(value):
     return re.sub(r"\s+", " ", value or "").strip().casefold()
 
 
-def enqueue(kind, job=None, schedule_key=None):
-    if kind not in {"onboard", "scan", "question", "revise"}:
-        raise ValueError("研究任务类型无效")
-    profile = get_profile()
-    if not profile.chat_verified or (kind != "revise" and not profile.search_verified):
-        raise ValueError("请在模型设置中完成连接和联网测试")
-    if kind in {"onboard", "scan", "question"} and profile.provider not in {"deepseek", "zhipu", "moonshot"}:
-        raise ValueError("当前资料检索需要可返回检索内容的服务商配置")
-    if kind == "scan":
-        station = status()
-        if not station["watchlist_confirmed"] or not station["sources_confirmed"]:
-            raise ValueError("请先确认关注名单和资料来源范围")
-        if not db.one("SELECT id FROM entities WHERE followed=1 AND state='active' LIMIT 1") and not db.one("SELECT id FROM topics WHERE research_state='active' LIMIT 1"):
-            raise ValueError("关注名单中没有启用的厂商或专题")
-    job = job or {}
-    if kind == "scan":
-        job = {**job, "scope": station_scope()}
-    with db.transaction() as connection:
-        active = connection.execute("SELECT id FROM tasks WHERE kind IN ('onboard','scan','question','revise') AND status IN ('queued','running') LIMIT 1").fetchone()
-        if active:
-            raise ValueError("已有研究任务正在排队或执行，请等待完成")
-        try:
-            cursor = connection.execute(
-                "INSERT INTO tasks(kind,status,prompt,profile_id,profile_fingerprint,provider,model,created_at,job_json,schedule_key) VALUES(?,'queued',?,?,?,?,?,?,?,?)",
-                (kind, job.get("main_question", ""), profile.id, fingerprint(profile), profile.provider, profile.model, db.now(), encode(job), schedule_key),
-            )
-        except sqlite3.IntegrityError:
-            if schedule_key:
-                existing = connection.execute("SELECT id FROM tasks WHERE schedule_key=?", (schedule_key,)).fetchone()
-                if existing:
-                    return existing["id"]
-            raise
-        return cursor.lastrowid
+def enqueue(kind, job=None, schedule_key=None, automatic=False):
+    from .research import enqueue as enqueue_research
+    return enqueue_research(kind, job, schedule_key, automatic=automatic)
 
 
 def status():
@@ -68,6 +38,9 @@ def status():
 
 def retry(task_id):
     task = db.one("SELECT * FROM tasks WHERE id=?", (task_id,))
+    if task and task.get("session_id"):
+        from .research import retry as retry_research
+        return retry_research(task_id)
     if not task or task["kind"] not in {"onboard", "scan", "question", "revise"} or task["status"] not in {"failed", "interrupted", "cancelled"}:
         raise ValueError("该任务当前不能继续执行")
     if fingerprint(get_profile(task["profile_id"])) != task["profile_fingerprint"]:
@@ -92,17 +65,27 @@ def record_step(task_id, stage, status_value, inputs=None, outputs=None):
     )
 
 
-def save_document(source, task_id):
-    url = source_url(source.url)
+def save_document(source, task_id, historical=False):
+    from .continuity import canonical_url, document_for_url
+    original_url = source_url(source.url)
+    url = canonical_url(original_url)
     content_hash = hashlib.sha256(source.content.encode()).hexdigest()
     timestamp = db.now()
+    previous = document_for_url(url)
+    if previous:
+        url = previous["url"]
+    preserve = previous and (historical or ("原文" in previous["extent"] and "原文" not in source.extent))
     with db.transaction() as connection:
         connection.execute(
             "INSERT INTO documents(url,title,published_at,first_seen_at,last_fetched_at,extent,content,content_hash) VALUES(?,?,?,?,?,?,?,?) "
-            "ON CONFLICT(url) DO UPDATE SET title=excluded.title,published_at=coalesce(excluded.published_at,documents.published_at),last_fetched_at=excluded.last_fetched_at,extent=excluded.extent,content=excluded.content,content_hash=excluded.content_hash",
+            "ON CONFLICT(url) DO NOTHING",
             (url, source.title[:300], source.published_at, timestamp, timestamp, source.extent, source.content, content_hash),
         )
         document_id = connection.execute("SELECT id FROM documents WHERE url=?", (url,)).fetchone()[0]
+        for alias in {original_url, canonical_url(original_url), url}:
+            connection.execute("INSERT OR IGNORE INTO source_aliases(url,document_id) VALUES(?,?)", (alias, document_id))
+        if previous and not preserve:
+            connection.execute("UPDATE documents SET title=?,published_at=coalesce(?,published_at),last_fetched_at=?,extent=?,content=?,content_hash=? WHERE id=?", (source.title[:300], source.published_at, timestamp, source.extent, source.content, content_hash, document_id))
         if task_id is not None:
             connection.execute("INSERT OR IGNORE INTO document_task_links(document_id,task_id) VALUES(?,?)", (document_id, task_id))
         connection.execute(
@@ -110,6 +93,11 @@ def save_document(source, task_id):
             (document_id, content_hash, source.content, source.extent, timestamp),
         )
         version_id = connection.execute("SELECT id FROM document_versions WHERE document_id=? AND content_hash=?", (document_id, content_hash)).fetchone()[0]
+        connection.execute("INSERT OR IGNORE INTO ingestion_queue(version_id,task_id,updated_at) VALUES(?,?,?)", (version_id, task_id, timestamp))
+    if previous and not preserve and previous["extent"] == source.extent and previous["content_hash"] != content_hash:
+        from .knowledge import invalidate
+        invalidate(document_id, "同一来源的内容版本发生变化，需要重新检查相关知识")
+        db.execute("UPDATE research_cache SET status='expired' WHERE kind='search_web' AND status='success' AND EXISTS (SELECT 1 FROM json_each(outputs_json,'$.sources') s JOIN source_aliases a ON a.url=json_extract(s.value,'$.url') WHERE a.document_id=?)", (document_id,))
     return document_id, version_id
 
 
@@ -129,7 +117,7 @@ def save_claim(document_id, version_id, statement, excerpt, label):
             "INSERT OR IGNORE INTO claims(document_id,document_version_id,statement,excerpt,label,verification,created_at) VALUES(?,?,?,?,?,?,?)",
             (document_id, version_id, statement.strip(), excerpt.strip(), label, verification, db.now()),
         )
-        return connection.execute("SELECT id FROM claims WHERE document_id=? AND statement=? AND label=?", (document_id, statement.strip(), label)).fetchone()[0]
+        return connection.execute("SELECT id FROM claims WHERE document_version_id=? AND statement=? AND label=?", (version_id, statement.strip(), label)).fetchone()[0]
 
 
 def entity(kind, name, state="active", parent_id=None, summary=""):
@@ -236,7 +224,7 @@ def revise(topic_id, purpose, conclusion, revision_status, boundaries, unresolve
         previous = connection.execute("SELECT * FROM judgment_versions WHERE id=?", (judgment["current_version_id"],)).fetchone() if judgment["current_version_id"] else None
         if not previous and revision_status in {"得到加强", "需要修正"}:
             revision_status = "初步判断"
-        if previous and normalized(previous["conclusion"]) == normalized(conclusion) and previous["status"] == revision_status and previous["event_id"] == event_id:
+        if previous and normalized(previous["conclusion"]) == normalized(conclusion) and normalized(previous["boundaries"]) == normalized(boundaries) and normalized(previous["unresolved"]) == normalized(unresolved) and previous["status"] == revision_status and previous["event_id"] == event_id:
             old_support = {row[0] for row in connection.execute("SELECT claim_id FROM judgment_evidence WHERE version_id=? AND stance='支持'", (previous["id"],))}
             old_oppose = {row[0] for row in connection.execute("SELECT claim_id FROM judgment_evidence WHERE version_id=? AND stance='反对'", (previous["id"],))}
             if old_support == set(support_ids) and old_oppose == set(oppose_ids):
@@ -277,20 +265,21 @@ def start_run(task_id, scope):
     return db.one("SELECT * FROM collection_runs WHERE task_id=?", (task_id,))
 
 
-def finish_run(run_id, run_status, event_ids, revision_ids, questions, details=""):
+def finish_run(run_id, run_status, event_ids, revision_ids, questions, details="", checked_until=None):
     if run_status not in {"complete", "partial", "failed"}:
         raise ValueError("采集结果状态无效")
     run = db.one("SELECT * FROM collection_runs WHERE id=?", (run_id,))
+    coverage_end = min(run["window_end"], checked_until) if checked_until else run["window_end"]
     with db.transaction() as connection:
         connection.execute("UPDATE collection_runs SET status=?,details=?,finished_at=? WHERE id=?", (run_status, details, db.now(), run_id))
         connection.execute("UPDATE station_settings SET last_status=?,last_error=? WHERE id=1", (run_status, details))
         if run_status in {"complete", "partial"}:
             if run_status == "complete":
-                connection.execute("UPDATE station_settings SET last_success_at=? WHERE id=1", (db.now(),))
+                connection.execute("UPDATE station_settings SET last_success_at=max(coalesce(last_success_at,''),?) WHERE id=1", (coverage_end,))
             connection.execute(
                 "INSERT INTO daily_issues(run_id,coverage_start,coverage_end,status,event_ids_json,revision_ids_json,next_questions_json,created_at) VALUES(?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(run_id) DO UPDATE SET status=excluded.status,event_ids_json=excluded.event_ids_json,revision_ids_json=excluded.revision_ids_json,next_questions_json=excluded.next_questions_json,created_at=excluded.created_at",
-                (run_id, run["window_start"], run["window_end"], run_status, encode(event_ids), encode(revision_ids), encode(questions), db.now()),
+                (run_id, min(run["window_start"], coverage_end) if run["window_start"] else None, coverage_end, run_status, encode(event_ids), encode(revision_ids), encode(questions), db.now()),
             )
 
 

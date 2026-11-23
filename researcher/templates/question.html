@@ -18,6 +18,7 @@
     <section class="panel">
       <div class="panel-head"><h2>{{ icon('spark') }}研究回答</h2>{% if task %}{{ task_badge(task) }}{% else %}<span class="badge dot tone-{{ item.status|tone }}">{{ question_states.get(item.status, item.status) }}</span>{% endif %}</div>
       {% if task and task.status=='success' %}
+      {% if task.session_id %}<p><a class="text-link" href="/research/{{ task.session_id }}">继续追问与查看知识积累{{ icon('arrow-right') }}</a></p>{% endif %}
       <div class="prose">{{ task.result_text|markdown }}</div>
       <p class="field-help section-space">{{ '模型认为已满足本次完成标准，仍请结合来源判断。' if result.complete else '本次证据未满足全部完成标准，以上缺口继续保留。' }}</p>
       {% elif task and task.status in ['failed','cancelled','interrupted'] %}

@@ -103,6 +103,13 @@
       {% endif %}
     </section>
 
+    {% if study_points %}
+    <section aria-labelledby="research-findings-title">
+      <div class="section-title"><h2 id="research-findings-title">{{ icon('search') }}本期研究发现</h2><a class="text-link" href="/research/{{ study_session_id }}">完整研究与后续问题{{ icon('arrow-right') }}</a></div>
+      <div class="stack-sm">{% for point in study_points %}<article class="panel compact"><p class="eyebrow">{{ point.category }}</p><p>{{ point.text }}</p><div class="meta">{% for source in point.sources %}<a href="/documents/{{ source.id }}?version={{ source.version_id }}#chunk-{{ source.chunk_id }}">{{ source.title }}</a>{% endfor %}</div></article>{% endfor %}</div>
+    </section>
+    {% endif %}
+
     <section aria-labelledby="revisions-title">
       <div class="section-title"><h2 id="revisions-title">{{ icon('layers') }}认知更新</h2><a class="text-link" href="/map">认知地图{{ icon('arrow-right') }}</a></div>
       <div class="stack-sm">

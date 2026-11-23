@@ -23,7 +23,7 @@ def test_existing_research_and_observation_migrate_without_becoming_evidence():
         result = subprocess.run([sys.executable, "-m", "researcher.cli", "check"], cwd=root, env=environment, capture_output=True, text=True, timeout=20)
         assert result.returncode == 0, result.stderr
         with sqlite3.connect(database) as connection:
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
             assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
             assert connection.execute("SELECT count(*) FROM topics").fetchone()[0] == 1
             assert connection.execute("SELECT count(*) FROM messages").fetchone()[0] == 1

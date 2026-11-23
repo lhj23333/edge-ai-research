@@ -1,0 +1,32 @@
+{% extends 'base.html' %}
+{% from 'macros.html' import token with context %}
+{% from 'ui.html' import icon, page_header, empty %}
+{% block content %}
+{{ page_header('Research', '探索研究', '从一个目标开始，结合已有知识调查、核验证据，并继续追问。') }}
+<div class="layout-split">
+  <div class="stack">
+    <section class="panel">
+      <div class="panel-head"><h2>{{ icon('search') }}提出研究目标</h2><span class="badge">{{ knowledge_count }} 项可复用知识</span></div>
+      <form action="/research" method="post" class="stack-form section-space">{{ token() }}
+        <label>希望了解什么？<textarea name="message" rows="5" maxlength="5000" required placeholder="例如：结合已保存资料，研究边缘生成式 AI 加速器的软件支持和部署限制，找出仍需要原始资料验证的关键问题。"></textarea></label>
+        <div class="field-row"><label>研究用途<select name="purpose"><option>行业竞争</option><option>部署决策</option></select></label><label>应用场景（可选）<input name="scenario" maxlength="500"></label></div>
+        <label>完成标准<input name="completion" maxlength="1000" value="形成有原文依据的结论、适用条件和仍待核实的问题"></label>
+        <label class="check-row"><input type="checkbox" name="force_refresh" value="yes"><span>检查最新资料</span></label>
+        {% if notes %}<details><summary>选择本次使用的个人批注</summary>{% for note in notes %}<label class="check-row"><input type="checkbox" name="note_id" value="{{ note.id }}"><span>{{ note.body[:180] }}</span></label>{% endfor %}</details>{% endif %}
+        <p class="field-help">已有证据、调查发现和知识更新分别保存。证据不足时会说明缺口；个人批注仅用于本次明确选择的研究。</p>
+        <div class="form-actions"><button type="submit" class="button primary">开始研究{{ icon('arrow-right') }}</button><a class="button" href="/questions">使用定向研究表单</a></div>
+      </form>
+    </section>
+    <section class="panel">
+      <div class="panel-head"><h2>{{ icon('clock') }}研究会话</h2></div>
+      <form action="/research" method="get" class="search-bar"><input name="q" value="{{ q }}" placeholder="搜索研究目标"><button class="button" type="submit">搜索</button></form>
+      <div class="list">{% for item in sessions %}<a class="list-item" href="/research/{{ item.id }}"><strong>{{ item.title }}</strong><small><span class="badge dot tone-{{ item.status|tone }}">{{ states.get(item.status, {'complete':'已完成','partial':'部分回答','needs_input':'需要补充'}.get(item.status,item.status)) }}</span> {{ item.updated_at|localtime }}</small></a>{% else %}{{ empty('尚无探索研究', '提出研究目标后，可以在同一会话继续追问。', 'search') }}{% endfor %}</div>
+    </section>
+  </div>
+  <aside class="panel">
+    <div class="panel-head"><h2>{{ icon('target') }}后续研究问题</h2></div>
+    <p class="panel-note">自动更新开启后，系统会在确认的关注范围和调用额度内继续调查。</p>
+    <div class="stack-sm section-space">{% for gap in gaps %}<article class="panel compact"><h3>{{ gap.question }}</h3><p>{{ gap.reason }}</p><small>重要性 {{ gap.priority }}/5 · {{ {'open':'等待研究','deferred':'等待新资料','running':'研究中','paused':'已暂停'}.get(gap.status,gap.status) }}</small><div class="form-actions">{% if gap.status!='running' %}<form action="/research/gaps/{{ gap.id }}/start" method="post">{{ token() }}<button class="button small" type="submit">开始研究</button></form>{% endif %}{% if gap.automatic_allowed %}<form action="/research/gaps/{{ gap.id }}/pause" method="post">{{ token() }}<button class="button small" type="submit">暂停自动研究</button></form>{% endif %}</div></article>{% else %}<p class="muted">研究过程中发现的证据缺口会保存在这里。</p>{% endfor %}</div>
+  </aside>
+</div>
+{% endblock %}

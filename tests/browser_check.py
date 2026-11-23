@@ -20,7 +20,7 @@ URL = "http://127.0.0.1:18765"
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--live", action="store_true")
-    parser.add_argument("--paths", nargs="*", default=["/", "/updates", "/map", "/companies", "/compare", "/evidence", "/questions", "/personal", "/watchlist", "/settings", "/tasks", "/library"])
+    parser.add_argument("--paths", nargs="*", default=["/", "/updates", "/map", "/companies", "/compare", "/evidence", "/questions", "/research", "/personal", "/watchlist", "/settings", "/tasks", "/library"])
     arguments = parser.parse_args()
     base_url = "http://127.0.0.1:8765" if arguments.live else URL
     server = None if arguments.live else subprocess.Popen([sys.executable, "-m", "researcher.cli", "run", "--port", "18765"], cwd=ROOT, env=os.environ.copy())
@@ -96,12 +96,12 @@ def main():
             assert page.locator("input[name='base_url']").input_value() == "https://api.deepseek.com/v1"
             page.goto(URL + "/library")
             page.locator("input[name='q']").fill("独立 AI 加速器")
-            page.get_by_role("button", name="搜索", exact=False).click()
+            page.get_by_role("button", name="搜索", exact=True).click()
             page.wait_for_url("**/library?q=*")
             assert page.get_by_role("heading", name="没有找到相关成果").count() == 1
             for width in (1440, 390):
                 page.set_viewport_size({"width": width, "height": 900})
-                for path in ("/", "/updates", "/map", "/companies", "/compare", "/evidence", "/questions", "/personal", "/watchlist", "/settings", "/tasks", "/library"):
+                for path in ("/", "/updates", "/map", "/companies", "/compare", "/evidence", "/questions", "/research", "/personal", "/watchlist", "/settings", "/tasks", "/library"):
                     page.goto(URL + path)
                     assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth"), (width, path)
             assert errors == [], errors
