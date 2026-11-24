@@ -1,5 +1,5 @@
 {% extends 'base.html' %}
-{% from 'macros.html' import token, task_badge, sources_list with context %}
+{% from 'macros.html' import token, task_badge with context %}
 {% from 'ui.html' import icon %}
 {% block content %}
 {% set coverage_states = {'checked':'已取得相关资料','no_results':'检索无结果','uncovered':'结果未覆盖目标','deferred':'尚未执行','failed':'检索失败'} %}
@@ -11,7 +11,7 @@
     <div class="page-title">
       <p class="eyebrow">Task / {{ task.id }}</p>
       <h1>{{ kinds.get(task.kind) }}</h1>
-      <div class="page-meta"><span>{{ icon('layers') }}{{ task.topic_title or '行业研究' }}</span><span>{{ icon('spark') }}<span class="mono">{{ presets[task.provider].name }} / {{ task.model }}</span></span><time>{{ icon('clock') }}<span class="mono">{{ task.created_at|localtime }}</span></time></div>
+      <div class="page-meta"><span>{{ icon('layers') }}{{ task.topic_title or '工作台' }}</span>{% if task.provider in presets %}<span>{{ icon('spark') }}<span class="mono">{{ presets[task.provider].name }} / {{ task.model }}</span></span>{% endif %}<time>{{ icon('clock') }}<span class="mono">{{ task.created_at|localtime }}</span></time></div>
     </div>
     <div class="page-actions">{{ task_badge(task) }}</div>
   </div>
@@ -26,9 +26,9 @@
   <p class="muted">页面会自动显示任务状态。</p>
   <div class="form-actions"><form action="/tasks/{{ task.id }}/cancel" method="post">{{ token() }}<button class="button caution" type="submit">{{ icon('stop') }}取消任务</button></form><small class="muted">已发出的服务商请求仍可能产生费用。</small></div>
   {% endif %}
-  {% if task.kind in ['onboard','scan','question','revise','interactive','followup'] and task.status in ['failed','interrupted','cancelled'] %}<form action="/tasks/{{ task.id }}/retry" method="post" class="retry-form">{{ token() }}<button class="button primary" type="submit">{{ icon('refresh') }}继续处理已保存资料</button><p class="field-help">使用本任务剩余额度，复用已完成操作；点击后允许重新请求此前执行结果未知的操作。</p></form>{% endif %}
+  {% if task.kind in ['onboard','question','revise','interactive','followup','event_research'] and task.session_id and task.status in ['failed','interrupted','cancelled'] %}<form action="/tasks/{{ task.id }}/retry" method="post" class="retry-form">{{ token() }}<button class="button primary" type="submit">{{ icon('refresh') }}继续处理已保存资料</button><p class="field-help">使用本任务剩余额度，复用已完成操作；点击后允许重新请求此前执行结果未知的操作。</p></form>{% endif %}
   {% if task.session_id %}<p><a class="button primary" href="/research/{{ task.session_id }}">阅读研究会话并继续追问{{ icon('arrow-right') }}</a></p>{% endif %}
-  <div class="actions">{% if brief %}<a class="button" href="/briefs/{{ brief.id }}">阅读历史简报{{ icon('arrow-right') }}</a>{% endif %}{% if artifact %}<a class="button" href="/artifacts/{{ artifact.id }}">查看成果{{ icon('arrow-right') }}</a>{% endif %}{% if task.kind=='onboard' %}<a class="button primary" href="/watchlist">核对候选名单{{ icon('arrow-right') }}</a>{% elif task.kind=='scan' %}<a class="button primary" href="/">阅读今日简报{{ icon('arrow-right') }}</a><a class="button" href="/updates">查看行业动态{{ icon('arrow-right') }}</a>{% elif task.kind=='question' %}<a class="button" href="/questions">查看定向研究{{ icon('arrow-right') }}</a>{% elif task.kind=='revise' %}<a class="button primary" href="/map">阅读专题判断{{ icon('arrow-right') }}</a>{% elif task.topic_id %}<a class="button" href="/topics/{{ task.topic_id }}">返回历史主题{{ icon('arrow-right') }}</a>{% else %}<a class="button" href="/settings">返回模型设置{{ icon('arrow-right') }}</a>{% endif %}</div>
+  <div class="actions">{% if brief %}<a class="button" href="/briefs/{{ brief.id }}">阅读历史简报{{ icon('arrow-right') }}</a>{% endif %}{% if artifact %}<a class="button" href="/artifacts/{{ artifact.id }}">查看成果{{ icon('arrow-right') }}</a>{% endif %}{% if task.kind=='onboard' %}<a class="button primary" href="/watchlist">核对候选名单{{ icon('arrow-right') }}</a>{% elif task.kind=='feed' %}<a class="button primary" href="/">阅读今日简报{{ icon('arrow-right') }}</a><a class="button" href="/updates">查看行业动态{{ icon('arrow-right') }}</a>{% elif task.kind=='selectbench' %}<a class="button" href="/admin/eval">查看 SelectBench 评测{{ icon('arrow-right') }}</a>{% elif task.kind=='question' %}<a class="button" href="/questions">查看定向研究{{ icon('arrow-right') }}</a>{% elif task.kind=='revise' %}<a class="button primary" href="/map">阅读专题判断{{ icon('arrow-right') }}</a>{% elif task.topic_id %}<a class="button" href="/topics/{{ task.topic_id }}">返回历史主题{{ icon('arrow-right') }}</a>{% else %}<a class="button" href="/settings">返回模型设置{{ icon('arrow-right') }}</a>{% endif %}</div>
 </section>
 
 {% if task.result_text %}<article class="panel prose article section-space">{{ task.result_text|markdown }}</article>{% endif %}
@@ -55,11 +55,11 @@
 {% if documents %}
 <section class="panel section-space">
   <div class="panel-head"><h2>{{ icon('database') }}本次取得的资料</h2><span class="panel-note mono">{{ documents|length }}</span></div>
-  <div class="list">{% for document in documents %}<a class="list-item" href="/documents/{{ document.id }}"><strong>{{ document.title }}</strong><small>{{ document.extent }} · <span class="mono">{{ document.last_fetched_at|localtime }}</span></small></a>{% endfor %}</div>
+  <div class="list">{% for document in documents %}<a class="list-item" href="/documents/{{ document.id }}?version={{ document.version_id }}"><strong>{{ document.title }}</strong><small>{{ document.extent }} · <span class="mono">{{ document.fetched_at|localtime }}</span></small></a>{% endfor %}</div>
 </section>
 {% endif %}
 
-{% if sources %}<div class="section-space">{{ sources_list(sources) }}</div>{% endif %}
+{% if feed_runs %}<section class="panel section-space"><div class="panel-head"><h2>信源抓取记录</h2><a class="text-link" href="/admin/funnel">漏斗诊断{{ icon('arrow-right') }}</a></div><div class="list">{% for run in feed_runs %}<article class="list-item"><a href="/admin/sources?edit={{ run.source_id }}"><strong>{{ run.name }}</strong></a><small>{{ run.status }} · 抓取 {{ run.fetched_count }} · 新增 {{ run.new_count }} · 拦截 {{ run.gated_count }}{% if run.error %} · {{ run.error }}{% endif %}</small></article>{% endfor %}</div></section>{% endif %}
 
 <section class="panel flush section-space">
   <div class="panel-head padded"><h2>{{ icon('terminal') }}API 请求记录</h2><span class="panel-note mono">{{ calls|length }} 次</span></div>
@@ -67,7 +67,7 @@
   <div class="table-scroll">
     <table class="data-table">
       <thead><tr><th scope="col">操作</th><th scope="col">状态</th><th scope="col" class="num">输入 token</th><th scope="col" class="num">输出 token</th><th scope="col" class="num">token 费用估算</th></tr></thead>
-      <tbody>{% for call in calls %}<tr><td class="mono">{{ call.operation }}</td><td><span class="badge dot tone-{{ call.status|tone }}">{{ call.status }}</span></td><td class="num mono">{{ call.input_tokens if call.input_tokens is not none else '服务商未提供' }}</td><td class="num mono">{{ call.output_tokens if call.output_tokens is not none else '服务商未提供' }}</td><td class="num mono">{{ '¥ %.5f'|format(call.estimate) if call.estimate is not none else '未估算' }}</td></tr>{% else %}<tr><td colspan="5" class="muted">尚未发出 API 请求。</td></tr>{% endfor %}</tbody>
+      <tbody>{% for call in calls %}<tr><td class="mono">{{ call.route or call.operation }}{% if call.route and call.operation != call.route %}<small>{{ call.operation }}</small>{% endif %}</td><td><span class="badge dot tone-{{ call.status|tone }}">{{ call.status }}</span></td><td class="num mono">{{ call.input_tokens if call.input_tokens is not none else '服务商未提供' }}</td><td class="num mono">{{ call.output_tokens if call.output_tokens is not none else '服务商未提供' }}</td><td class="num mono">{{ '¥ %.5f'|format(call.estimate) if call.estimate is not none else '未估算' }}</td></tr>{% else %}<tr><td colspan="5" class="muted">尚未发出 API 请求。</td></tr>{% endfor %}</tbody>
     </table>
   </div>
 </section>

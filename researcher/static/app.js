@@ -8,16 +8,24 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   });
   document.querySelectorAll("form[method='post']").forEach((form) => {
-    form.addEventListener("submit", () => {
-      form.querySelectorAll("button[type='submit']").forEach((button) => {
-        button.disabled = true;
-        button.setAttribute("aria-busy", "true");
-      });
+    form.addEventListener("submit", (event) => {
+      if (form.dataset.submitting) {
+        event.preventDefault();
+        return;
+      }
+      form.dataset.submitting = "true";
+      form.addEventListener("formdata", () => {
+        form.querySelectorAll("button[type='submit']").forEach((button) => {
+          button.disabled = true;
+          button.setAttribute("aria-busy", "true");
+        });
+      }, {once: true});
     });
   });
   // 浏览器后退恢复缓存页面时，提交中的按钮需要重新可用
   window.addEventListener("pageshow", (event) => {
     if (!event.persisted) return;
+    document.querySelectorAll("form[data-submitting]").forEach((form) => delete form.dataset.submitting);
     document.querySelectorAll("button[aria-busy='true']").forEach((button) => {
       button.disabled = false;
       button.removeAttribute("aria-busy");

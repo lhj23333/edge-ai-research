@@ -1,0 +1,31 @@
+{% extends 'base.html' %}
+{% from 'macros.html' import token with context %}
+{% from 'ui.html' import icon, page_header, empty %}
+{% block content %}
+{% call page_header('', '漏斗诊断', '查看发布日期校验、预筛、两次评分与聚簇经过。') %}<a class="button" href="/admin/eval">SelectBench 评测{{ icon('arrow-right') }}</a>{% endcall %}
+<form method="get" class="toolbar"><label>关键词<input type="search" name="q" value="{{ q }}"></label><label>阶段<select name="state"><option value="">全部</option>{% for key,name in states.items() %}<option value="{{ key }}" {{ 'selected' if key==state }}>{{ name }}</option>{% endfor %}</select></label><label>信源<select name="source_id"><option value="">全部</option>{% for source in sources %}<option value="{{ source.id }}" {{ 'selected' if source.id==source_id }}>{{ source.name }}</option>{% endfor %}</select></label><button class="button" type="submit">筛选</button></form>
+<div class="layout-split">
+  <div class="stack">
+    {% if item %}
+    <section class="panel"><div class="panel-head"><h2>{{ item.title }}</h2><span class="badge">{{ '评分已达门槛，待继续处理' if selection_retry else states[item.state] }}</span></div>
+      {% if selection_retry %}<p class="alert tone-warning">{{ selection_retry_notice }}</p>
+      <form class="form-actions" method="post" action="/admin/funnel/{{ item.id }}/retry">{{ token() }}<button type="submit" class="button primary">继续处理</button></form>{% endif %}
+      <p class="meta">{{ item.tier }}{% if item.category %} · {{ item.category }}{% endif %} · {{ reasons.get(item.gate_reason, '') }}</p>
+      <p class="meta">发现 {{ item.discovered_at|localtime }} · 发布 {{ item.published_at|localtime if item.published_at else '待确认' }} · 入选门槛 {{ threshold }}</p>
+      {% if item.error %}<p class="alert tone-warning">{{ item.error }}</p>{% endif %}
+      <div class="actions"><a href="{{ item.canonical_url }}" target="_blank" rel="noopener noreferrer">原始地址</a>{% if item.document_id %}<a href="/documents/{{ item.document_id }}{% if item.get('version_id') is not none %}?version={{ item.version_id }}{% endif %}">保存的原文</a>{% endif %}{% if item.event_id %}<a href="/events/{{ item.event_id }}">关联事件</a>{% endif %}</div>
+    </section>
+    <section class="panel"><div class="panel-head"><h2>评分与模型用量</h2></div><div class="list">
+      {% for step in evaluations %}<article class="list-item"><strong>{{ step.stage }} · {{ step.models or '等待模型' }}{% if step.score is not none %} · {{ step.score }} 分{% endif %}</strong><small>{{ step.reason or step.status }}</small><small>提示词 {{ step.prompt_version }} · {{ step.calls }} 次 · 输入 {{ step.input_tokens if step.input_tokens is not none else '—' }} / 输出 {{ step.output_tokens if step.output_tokens is not none else '—' }} token{% if step.estimate is not none %} · ¥ {{ '%.5f'|format(step.estimate) }}{% endif %}</small></article>{% else %}<p class="muted">该条目尚无模型评估。</p>{% endfor %}
+    </div>
+    {% if item.score is not none or item.manual_score is not none %}<form class="stack-form" method="post" action="/admin/funnel/{{ item.id }}/score">{{ token() }}<label>人工评分<input name="score" type="number" min="0" max="100" step="any" value="{{ item.manual_score if item.manual_score is not none else item.score }}" required></label><label>更正理由<input name="reason" value="{{ item.manual_reason }}" maxlength="500" required></label><button type="submit" class="button">保存评分</button></form>{% endif %}
+    {% if item.state in ['discovered','selected','pending_date'] %}<form class="form-actions" method="post" action="/admin/funnel/{{ item.id }}/retry">{{ token() }}<button type="submit" class="button">继续处理此条目</button></form>{% endif %}
+    </section>
+    {% if decisions %}<section class="panel"><div class="panel-head"><h2>聚簇判定</h2></div><div class="list">
+      {% for decision in decisions %}<article class="list-item"><a href="/events/{{ decision.final_event_id }}"><strong>{{ decision.title }}</strong></a><small>{{ decision.relation }}{% if decision.similarity is not none %} · 相似度 {{ '%.3f'|format(decision.similarity) }}{% endif %}{% if decision.reviewed %} · 已复核{% endif %}{% if decision.manual %} · 人工修正{% endif %} · {{ decision.reason }}</small>{% if decision.candidates %}<details><summary>召回候选</summary>{% for candidate in decision.candidates %}<div><a href="/events/{{ candidate.id }}">{{ candidate.title }}</a> · {{ '%.3f'|format(candidate.similarity) }}</div>{% endfor %}</details>{% endif %}</article>{% endfor %}
+    </div>{% if item.state=='clustered' %}<form class="stack-form" method="post" action="/admin/funnel/{{ item.id }}/assign">{{ token() }}<label>目标事件编号<input name="event_id" type="number" min="1" value="{{ item.event_id }}" required></label><label>归属理由<input name="reason" maxlength="500" required></label><button class="button" type="submit">保存并锁定归属</button></form>{% endif %}</section>{% endif %}
+    {% else %}{{ empty('选择一条资料查看评估记录', '', 'filter') }}{% endif %}
+  </div>
+  <section class="panel"><div class="panel-head"><h2>资料条目</h2><span class="panel-note">{{ items|length }} 条</span></div><div class="list">{% for row in items %}<a class="list-item" href="/admin/funnel?item_id={{ row.id }}"><strong>{{ row.title }}</strong><small>{{ row.source_name }} · {{ '评分已达门槛，待继续处理' if row.selection_retry else states[row.state] }}{% if row.manual_score is not none or row.score is not none %} · {{ row.manual_score if row.manual_score is not none else row.score }} 分{% endif %}</small></a>{% else %}<p class="muted">没有匹配条目。</p>{% endfor %}</div></section>
+</div>
+{% endblock %}

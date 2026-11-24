@@ -1,12 +1,14 @@
 import asyncio
+import fcntl
 import hashlib
 import ipaddress
 import io
-import json
 import os
 import socket
 import sqlite3
 import threading
+from contextlib import closing, contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -27,6 +29,8 @@ from .providers import ResearchError, Source, source_url
 INDEX_LOCK = threading.RLock()
 MODEL_LOCK = threading.RLock()
 INDEX_VERSION = "bge-chunks-1"
+EVENT_MODEL = "BAAI/bge-m3"
+EVENT_DIMENSION = 1024
 MODELS = Path(os.environ.get("RESEARCHER_MODELS_DIR", DATA / "models")).resolve()
 
 
@@ -65,7 +69,7 @@ def terms(value):
     return " ".join(part.casefold() for part in tokenizer().cut_for_search(value) if part.strip())
 
 
-def index_connection(dimension):
+def index_connection(dimension=None):
     connection = sqlite3.connect(DATA / "search.sqlite3", timeout=30)
     connection.row_factory = sqlite3.Row
     connection.enable_load_extension(True)
@@ -75,12 +79,51 @@ def index_connection(dimension):
     connection.execute("CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
     connection.execute("CREATE TABLE IF NOT EXISTS chunk_hashes(id INTEGER PRIMARY KEY,hash TEXT NOT NULL)")
     connection.execute("CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(title,terms)")
-    connection.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(embedding float[{dimension}])")
+    if dimension is not None:
+        connection.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(embedding float[{dimension}])")
+    connection.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS event_vectors USING vec0(event_id INTEGER PRIMARY KEY, embedding float[{EVENT_DIMENSION}] distance_metric=cosine, active_at INTEGER, +digest TEXT)")
     return connection
+
+
+@contextmanager
+def index_writer(dimension=None):
+    with (DATA / "index.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        with closing(index_connection(dimension)) as index:
+            yield index
 
 
 def chunk_row(identifier):
     return db.one("SELECT c.*,d.id AS document_id,d.title,d.url,d.published_at,v.extent,v.fetched_at,v.verification FROM document_chunks c JOIN document_versions v ON v.id=c.version_id JOIN documents d ON d.id=v.document_id WHERE c.id=?", (identifier,))
+
+
+def event_documents(event_id):
+    return db.query("""
+        WITH materials AS (
+          SELECT i.document_id,i.version_id,i.published_at,i.tier,i.publisher_key,
+                 (SELECT relation FROM event_cluster_decisions r WHERE r.item_id=i.id ORDER BY id DESC LIMIT 1) AS relation
+          FROM feed_items i WHERE i.event_id=? AND i.state='clustered'
+          UNION ALL
+          SELECT DISTINCT c.document_id,c.document_version_id,d.published_at,NULL,d.publisher,NULL
+          FROM event_claims ec JOIN claims c ON c.id=ec.claim_id JOIN documents d ON d.id=c.document_id
+          WHERE ec.event_id=? AND NOT EXISTS (SELECT 1 FROM feed_items i WHERE i.event_id=ec.event_id
+            AND i.state='clustered' AND i.document_id=c.document_id AND i.version_id=c.document_version_id)
+        )
+        SELECT m.*,d.title,d.url,v.fetched_at,v.extent,(d.id=e.representative_document_id) AS representative
+        FROM materials m JOIN documents d ON d.id=m.document_id JOIN document_versions v ON v.id=m.version_id
+        JOIN events e ON e.id=? ORDER BY coalesce(m.published_at,v.fetched_at),v.id
+    """, (event_id, event_id, event_id))
+
+
+def event_chunks(event_id, limit):
+    documents = sorted(event_documents(event_id), key=lambda item: (not item["representative"], item["tier"] != "T1", item["tier"] != "T1.5"))
+    priority = documents[:limit]
+    if not priority:
+        return []
+    versions = {item["version_id"]: rank for rank, item in enumerate(priority)}
+    rows = db.query("SELECT id,version_id,position FROM document_chunks WHERE position<4 AND version_id IN (" + ",".join("?" for _ in versions) + ")", tuple(versions))
+    rows.sort(key=lambda item: (item["position"], versions[item["version_id"]]))
+    return [{**chunk_row(row["id"]), "chunk_id": row["id"]} for row in rows[:limit]]
 
 
 def ensure_index(rebuild=False, version_ids=None):
@@ -89,16 +132,19 @@ def ensure_index(rebuild=False, version_ids=None):
         model = embedding_model(config.embedding_model, config.device)
         dimension = model.get_embedding_dimension()
         signature = station.encode([INDEX_VERSION, config.embedding_model, dimension])
-        with index_connection(dimension) as index:
+        with index_writer(dimension) as index:
             old = index.execute("SELECT value FROM metadata WHERE key='signature'").fetchone()
             if old and old[0] != signature and not rebuild:
                 raise ResearchError("本地检索模型已变更，请运行 researcher index --rebuild 重建索引")
             if rebuild:
-                index.execute("DROP TABLE chunks_vec")
-                index.execute(f"CREATE VIRTUAL TABLE chunks_vec USING vec0(embedding float[{dimension}])")
-                index.execute("DELETE FROM chunks_fts")
-                index.execute("DELETE FROM chunk_hashes")
-            index.execute("INSERT OR REPLACE INTO metadata VALUES('signature',?)", (signature,))
+                with index:
+                    index.execute("DROP TABLE chunks_vec")
+                    index.execute(f"CREATE VIRTUAL TABLE chunks_vec USING vec0(embedding float[{dimension}])")
+                    index.execute("DELETE FROM chunks_fts")
+                    index.execute("DELETE FROM chunk_hashes")
+                    index.execute("DELETE FROM event_vectors")
+            with index:
+                index.execute("INSERT OR REPLACE INTO metadata VALUES('signature',?)", (signature,))
             splitter = RecursiveCharacterTextSplitter.from_huggingface_tokenizer(model.tokenizer, chunk_size=512, chunk_overlap=64, separators=["\n\n", "\n", "。", ". ", " ", ""])
             version_filter = " AND v.id IN (" + ",".join("?" for _ in version_ids) + ")" if version_ids else ""
             pending = db.query("SELECT v.*,d.title FROM document_versions v JOIN documents d ON d.id=v.document_id LEFT JOIN ingestion_queue q ON q.version_id=v.id WHERE (q.status IS NULL OR q.status='pending')" + version_filter + " ORDER BY v.id", tuple(version_ids or []))
@@ -108,33 +154,84 @@ def ensure_index(rebuild=False, version_ids=None):
                 pages = station.decode(snapshot["headers_json"]).get("page_spans", []) if snapshot else []
                 previous_start = -1
                 with db.transaction() as connection:
+                    queue = connection.execute("SELECT status FROM ingestion_queue WHERE version_id=?", (version["id"],)).fetchone()
+                    if queue and queue["status"] != "pending":
+                        continue
                     for position, document in enumerate(documents):
                         start = version["content"].find(document, previous_start + 1)
                         if start < 0:
                             raise ResearchError("资料片段与原文位置不吻合")
                         previous_start = start
                         page = next((item["page"] for item in pages if item["start"] <= start < item["end"]), None)
-                        connection.execute("INSERT OR IGNORE INTO document_chunks(version_id,position,start_offset,end_offset,page,heading,content,content_hash,created_at) VALUES(?,?,?,?,?,?,?,?,?)", (version["id"], position, start, start + len(document), page, version["title"], document, hashlib.sha256(document.encode()).hexdigest(), db.now()))
+                        station.save_document_chunk(connection, version["id"], position, start, page, version["title"], document)
                     connection.execute("INSERT INTO ingestion_queue(version_id,status,detail,updated_at) VALUES(?,'indexed',?,?) ON CONFLICT(version_id) DO UPDATE SET status='indexed',detail=excluded.detail,updated_at=excluded.updated_at", (version["id"], f"已建立 {len(documents)} 个原文片段", db.now()))
             chunks = db.query("SELECT c.*,d.title FROM document_chunks c JOIN document_versions v ON v.id=c.version_id JOIN documents d ON d.id=v.document_id ORDER BY c.id")
             hashes = {item["id"]: hashlib.sha256((item["content"] + item["title"]).encode()).hexdigest() for item in chunks}
             indexed = {row[0]: row[1] for row in index.execute("SELECT id,hash FROM chunk_hashes")}
-            for identifier, digest in list(indexed.items()):
-                if hashes.get(identifier) != digest:
-                    index.execute("DELETE FROM chunks_vec WHERE rowid=?", (identifier,))
-                    index.execute("DELETE FROM chunks_fts WHERE rowid=?", (identifier,))
-                    index.execute("DELETE FROM chunk_hashes WHERE id=?", (identifier,))
-                    del indexed[identifier]
+            with index:
+                for identifier, digest in list(indexed.items()):
+                    if hashes.get(identifier) != digest:
+                        index.execute("DELETE FROM chunks_vec WHERE rowid=?", (identifier,))
+                        index.execute("DELETE FROM chunks_fts WHERE rowid=?", (identifier,))
+                        index.execute("DELETE FROM chunk_hashes WHERE id=?", (identifier,))
+                        del indexed[identifier]
             missing = [chunk for chunk in chunks if chunk["id"] not in indexed]
             for start in range(0, len(missing), 16):
                 batch = missing[start:start + 16]
                 vectors = model.encode([item["content"] for item in batch], batch_size=8, normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=False)
-                for item, vector in zip(batch, vectors):
-                    index.execute("INSERT INTO chunks_fts(rowid,title,terms) VALUES(?,?,?)", (item["id"], terms(item["title"]), terms(item["content"])))
-                    index.execute("INSERT INTO chunks_vec(rowid,embedding) VALUES(?,?)", (item["id"], np.asarray(vector, dtype=np.float32).tobytes()))
-                    index.execute("INSERT INTO chunk_hashes VALUES(?,?)", (item["id"], hashes[item["id"]]))
-            index.commit()
-        return {"documents": len(pending), "new_chunks": len(missing), "chunks": len(chunks), "model": config.embedding_model, "device": config.device}
+                with index:
+                    for item, vector in zip(batch, vectors):
+                        index.execute("INSERT INTO chunks_fts(rowid,title,terms) VALUES(?,?,?)", (item["id"], terms(item["title"]), terms(item["content"])))
+                        index.execute("INSERT INTO chunks_vec(rowid,embedding) VALUES(?,?)", (item["id"], np.asarray(vector, dtype=np.float32).tobytes()))
+                        index.execute("INSERT INTO chunk_hashes VALUES(?,?)", (item["id"], hashes[item["id"]]))
+        count = sync_event_vectors() if rebuild else None
+        return {"documents": len(pending), "new_chunks": len(missing), "chunks": len(chunks), "event_vectors": count, "model": config.embedding_model, "device": config.device}
+
+
+def event_embeddings(texts):
+    with MODEL_LOCK:
+        model = embedding_model(EVENT_MODEL, options().device)
+        if model.get_embedding_dimension() != EVENT_DIMENSION:
+            raise ResearchError("事件向量需要 1024 维 BGE-M3 模型")
+        vectors = model.encode(texts, batch_size=8, normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=False)
+        return [np.asarray(vector, dtype=np.float32).tobytes() for vector in vectors]
+
+
+def sync_event_vectors(active_since=None):
+    activity = "coalesce((SELECT max(published_at) FROM feed_items WHERE event_id=e.id AND state='clustered'),e.published_at,e.occurred_at,e.created_at)"
+    with INDEX_LOCK, index_writer() as index:
+        cutoff = int(active_since.timestamp()) if active_since else 0
+        rows = db.query("SELECT * FROM (SELECT id,title,what_happened,CAST(strftime('%s'," + activity + ") AS INTEGER) AS active_at "
+                        "FROM events e WHERE state='active' AND canonical_event_id IS NULL) WHERE active_at>=?", (cutoff,))
+        indexed = {row["event_id"]: row for row in index.execute("SELECT event_id,active_at,digest FROM event_vectors WHERE active_at>=?", (cutoff,))}
+        changes = []
+        for row in rows:
+            content = row["title"] + "\n" + row["what_happened"]
+            digest = continuity.digest([EVENT_MODEL, content])
+            old = indexed.pop(row["id"], None)
+            if not old or old["digest"] != digest or old["active_at"] != row["active_at"]:
+                changes.append((row["id"], content, row["active_at"], digest))
+        with index:
+            index.executemany("DELETE FROM event_vectors WHERE event_id=?", ((identifier,) for identifier in indexed))
+        for start in range(0, len(changes), 16):
+            batch = changes[start:start + 16]
+            vectors = event_embeddings([row[1] for row in batch])
+            with index:
+                index.executemany("DELETE FROM event_vectors WHERE event_id=?", ((row[0],) for row in batch))
+                index.executemany("INSERT INTO event_vectors(event_id,embedding,active_at,digest) VALUES(?,?,?,?)",
+                                  ((identifier, vector, active_at, digest) for (identifier, _, active_at, digest), vector in zip(batch, vectors)))
+        return len(rows)
+
+
+def recall_events(text, active_since, limit):
+    with INDEX_LOCK:
+        vector, = event_embeddings([text])
+        if not sync_event_vectors(active_since):
+            return []
+        with closing(index_connection()) as index:
+            return [(row["event_id"], 1 - row["distance"]) for row in index.execute(
+                "SELECT event_id,distance FROM event_vectors WHERE embedding MATCH ? AND k=? AND active_at>=? ORDER BY distance",
+                (vector, limit, int(active_since.timestamp())))]
 
 
 def search(query, limit=None, include_history=False):
@@ -144,7 +241,7 @@ def search(query, limit=None, include_history=False):
     with INDEX_LOCK, MODEL_LOCK:
         model = embedding_model(config.embedding_model, config.device)
         vector = model.encode([query], normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=False)[0]
-        with index_connection(model.get_embedding_dimension()) as index:
+        with closing(index_connection(model.get_embedding_dimension())) as index:
             query_terms = list(dict.fromkeys(part for part in terms(query).split() if len(part) > 1))[:30]
             lexical = [row[0] for row in index.execute("SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ? ORDER BY bm25(chunks_fts) LIMIT 40", (" OR ".join('"' + part.replace('"', '""') + '"' for part in query_terms),))] if query_terms else []
             semantic = [row[0] for row in index.execute("SELECT rowid,distance FROM chunks_vec WHERE embedding MATCH ? AND k=40 ORDER BY distance", (np.asarray(vector, dtype=np.float32).tobytes(),))]
@@ -208,16 +305,69 @@ def invalidate(document_id, reason):
         connection.execute("UPDATE judgments SET status='待核实' WHERE current_version_id IN (SELECT je.version_id FROM judgment_evidence je JOIN claims c ON c.id=je.claim_id WHERE c.document_id=?)", (document_id,))
 
 
-async def public_url(value):
+async def public_target(value, allowed_hosts=()):
     url = source_url(value)
-    parts = urlsplit(url)
-    if parts.port and parts.port not in (80, 443):
+    target = httpx.URL(url)
+    host = target.raw_host.decode().lower().rstrip(".")
+    private = host in allowed_hosts
+    if not private and target.port and target.port not in (80, 443):
         raise ResearchError("仅能读取公开网页的标准 HTTP 或 HTTPS 端口")
     loop = asyncio.get_running_loop()
-    records = await loop.getaddrinfo(parts.hostname, parts.port or (443 if parts.scheme == "https" else 80), type=socket.SOCK_STREAM)
-    if not records or any(not ipaddress.ip_address(record[4][0]).is_global for record in records):
+    records = await loop.getaddrinfo(host, target.port or (443 if target.scheme == "https" else 80), type=socket.SOCK_STREAM)
+    addresses = [ipaddress.ip_address(record[4][0]) for record in records]
+    if not addresses or any(a.is_link_local or a.is_multicast or a.is_unspecified or a.is_reserved
+                            or str(a) in {"fd00:ec2::254", "100.100.100.200", "192.0.0.192"}
+                            or (not private and not a.is_global) for a in addresses):
         raise ResearchError("资料地址必须指向公开互联网，不能访问本机或内部网络")
-    return url
+    return target, min(addresses, key=lambda address: address.version)
+
+
+async def public_url(value, allowed_hosts=()):
+    url, _ = await public_target(value, allowed_hosts)
+    return str(url)
+
+
+@dataclass(frozen=True)
+class Resource:
+    url: str
+    status: int
+    headers: dict
+    body: bytes
+
+
+async def get_resource(client, url, *, checked=None, allowed_hosts=(), accept="*/*", max_bytes=None, prefix_only=False):
+    max_bytes = max_bytes or options().max_source_bytes
+    for _ in range(6):
+        target, address = await public_target(url, allowed_hosts)
+        headers = {"User-Agent": "Researcher/0.3 (public-source research)", "Accept": accept,
+                   "Host": target.netloc.decode(), "Connection": "close"}
+        if prefix_only:
+            headers["Accept-Encoding"] = "identity"
+        conditional = {}
+        if checked and str(target) == checked["final_url"]:
+            conditional = {header: checked[field] for header, field in (("If-None-Match", "etag"), ("If-Modified-Since", "last_modified")) if checked[field]}
+        # 连接已校验的 IP，TLS 和 Host 保留原始域名。
+        async with client.stream("GET", target.copy_with(host=str(address)), headers={**headers, **conditional},
+                                 extensions={"sni_hostname": target.raw_host.decode()}) as response:
+            metadata = {key: response.headers[key] for key in ("content-type", "etag", "last-modified") if key in response.headers}
+            if response.status_code == 304:
+                if not conditional:
+                    raise ResearchError("来源返回未修改状态，但没有已保存的响应")
+                return Resource(str(target), 304, metadata, b"")
+            if response.is_redirect:
+                url = urljoin(str(target), response.headers["location"])
+                continue
+            response.raise_for_status()
+            body = bytearray()
+            async for piece in response.aiter_bytes(chunk_size=8192 if prefix_only else None):
+                if prefix_only and len(body) + len(piece) >= max_bytes:
+                    body.extend(piece[:max_bytes - len(body)])
+                    break
+                body.extend(piece)
+                if len(body) > max_bytes:
+                    raise ResearchError("资料超过单份响应大小限制")
+            return Resource(str(target), response.status_code, metadata, bytes(body))
+    raise ResearchError("资料重定向次数超过限制")
 
 
 def extract_resource(body, content_type, url):
@@ -254,56 +404,42 @@ async def fetch(url, task_id, force=False):
     async def produce(cache_key):
         return await fetch_uncached(canonical, task_id)
     result = await continuity.cached_operation("read_source", {"url": canonical}, {}, task_id, produce, force=force)
-    db.execute("INSERT OR IGNORE INTO document_task_links(document_id,task_id) VALUES(?,?)", (result["document_id"], task_id))
+    with db.transaction() as connection:
+        station.link_document(connection, result["document_id"], task_id, result["version_id"])
     return result
 
 
 async def fetch_uncached(url, task_id):
-    config = options()
-    current = await public_url(url)
-    existing = continuity.document_for_url(current)
+    existing = continuity.document_for_url(url)
     checked = db.one("SELECT * FROM source_checks WHERE document_id=?", (existing["id"],)) if existing else None
-    headers = {"User-Agent": "Researcher/0.2 (public-source research)", "Accept": "text/html,application/pdf,text/plain,text/markdown"}
     async with httpx.AsyncClient(timeout=httpx.Timeout(45, connect=15), follow_redirects=False, trust_env=False) as client:
-        for _ in range(6):
-            conditional = dict(headers)
-            if checked and current == checked["final_url"]:
-                if checked["etag"]:
-                    conditional["If-None-Match"] = checked["etag"]
-                if checked["last_modified"]:
-                    conditional["If-Modified-Since"] = checked["last_modified"]
-            async with client.stream("GET", current, headers=conditional) as response:
-                if response.status_code == 304:
-                    if not checked or conditional == headers:
-                        raise ResearchError("来源返回未修改状态，但缺少可核对的原文版本")
-                    db.execute("UPDATE source_checks SET checked_at=? WHERE document_id=?", (db.now(), checked["document_id"]))
-                    return source_result(checked["document_id"], checked["version_id"], url, change_type="existing", http_status=304)
-                if response.is_redirect:
-                    current = await public_url(urljoin(current, response.headers["location"]))
-                    continue
-                response.raise_for_status()
-                pieces, size = [], 0
-                async for piece in response.aiter_bytes():
-                    size += len(piece)
-                    if size > config.max_source_bytes:
-                        raise ResearchError("资料超过单份原文大小限制")
-                    pieces.append(piece)
-                raw = b"".join(pieces)
-                content_type = response.headers.get("content-type", "text/html")
-                text, title, spans, extent = await asyncio.to_thread(extract_resource, raw, content_type, current)
-                if not text.strip():
-                    raise ResearchError("原文没有可提取文字，不能据此形成证据")
-                document_id, version_id = station.save_document(Source(title, current, text, extent), task_id)
-                for alias in {url, current}:
-                    db.execute("INSERT INTO source_aliases(url,document_id) VALUES(?,?) ON CONFLICT(url) DO UPDATE SET document_id=excluded.document_id", (continuity.canonical_url(alias), document_id))
-                metadata = {key: response.headers[key] for key in ("content-type", "etag", "last-modified") if key in response.headers}
-                metadata.update(final_url=current, page_spans=spans)
-                db.execute("INSERT OR IGNORE INTO source_snapshots(version_id,content_type,content_hash,body,headers_json,method,created_at) VALUES(?,?,?,?,?,'direct_http',?)", (version_id, content_type, hashlib.sha256(raw).hexdigest(), raw, station.encode(metadata), db.now()))
-                db.execute("INSERT INTO source_checks(document_id,version_id,checked_at,final_url,etag,last_modified) VALUES(?,?,?,?,?,?) ON CONFLICT(document_id) DO UPDATE SET version_id=excluded.version_id,checked_at=excluded.checked_at,final_url=excluded.final_url,etag=excluded.etag,last_modified=excluded.last_modified", (document_id, version_id, db.now(), current, metadata.get("etag", ""), metadata.get("last-modified", "")))
-                await asyncio.to_thread(ensure_index, False, [version_id])
-                change_type = "new" if not existing else "existing" if existing["content_hash"] == hashlib.sha256(text.encode()).hexdigest() else "updated"
-                return source_result(document_id, version_id, url, change_type=change_type, http_status=200)
-    raise ResearchError("资料重定向次数超过限制")
+        resource = await get_resource(client, url, checked=checked, accept="text/html,application/pdf,text/plain,text/markdown")
+    if resource.status == 304:
+        db.execute("UPDATE source_checks SET checked_at=? WHERE document_id=?", (db.now(), checked["document_id"]))
+        await asyncio.to_thread(ensure_index, False, [checked["version_id"]])
+        return source_result(checked["document_id"], checked["version_id"], url, change_type="existing", http_status=304)
+    document_id, version_id, content = await asyncio.to_thread(archive_resource, resource, url, task_id)
+    await asyncio.to_thread(ensure_index, False, [version_id])
+    changed = "new" if not existing else "existing" if existing["content_hash"] == hashlib.sha256(content.encode()).hexdigest() else "updated"
+    return source_result(document_id, version_id, url, change_type=changed, http_status=resource.status)
+
+
+def archive_resource(resource, requested_url, task_id, publication=None, publisher=None, fallback_title=None):
+    content_type = resource.headers.get("content-type", "text/html")
+    content, title, spans, extent = extract_resource(resource.body, content_type, resource.url)
+    if not content.strip():
+        raise ResearchError("原文没有可提取文字，不能据此形成证据")
+    if title == resource.url:
+        title = fallback_title or title
+    document_id, version_id = station.save_document(Source(title, resource.url, content, extent, publication), task_id)
+    metadata = {**resource.headers, "final_url": resource.url, "page_spans": spans}
+    with db.transaction() as connection:
+        connection.executemany("INSERT OR IGNORE INTO source_aliases(url,document_id) VALUES(?,?)", ((continuity.canonical_url(alias), document_id) for alias in {requested_url, resource.url}))
+        connection.execute("INSERT OR IGNORE INTO source_snapshots(version_id,content_type,content_hash,body,headers_json,method,created_at) VALUES(?,?,?,?,?,'direct_http',?)", (version_id, content_type, hashlib.sha256(resource.body).hexdigest(), resource.body, station.encode(metadata), db.now()))
+        connection.execute("INSERT INTO source_checks(document_id,version_id,checked_at,final_url,etag,last_modified) VALUES(?,?,?,?,?,?) ON CONFLICT(document_id) DO UPDATE SET version_id=excluded.version_id,checked_at=excluded.checked_at,final_url=excluded.final_url,etag=excluded.etag,last_modified=excluded.last_modified", (document_id, version_id, db.now(), resource.url, metadata.get("etag", ""), metadata.get("last-modified", "")))
+        if publisher:
+            connection.execute("UPDATE documents SET publisher=? WHERE id=? AND publisher=''", (publisher, document_id))
+    return document_id, version_id, content
 
 
 def put_knowledge(body, kind, claim_ids, task_id, conditions=None, topic_id=None, entity_id=None, reason="新增经核验的资料", existing_id=None, change_type="new", revalidated=False):
@@ -375,7 +511,7 @@ def related_knowledge(query, limit=20):
     return selected
 
 
-def context(query, scope=None):
+def context(query):
     selected = related_knowledge(query, 30)
     judgments = db.query("SELECT j.id,j.topic_id,j.purpose,j.status,v.conclusion,v.boundaries,v.unresolved FROM judgments j JOIN judgment_versions v ON v.id=j.current_version_id")
     for item in selected[:30]:

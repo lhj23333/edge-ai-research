@@ -1,36 +1,52 @@
 import hashlib
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 
 from . import continuity, db, station
-from .config import ResearchSettings, fingerprint, get_profile, settings
+from .config import ResearchSettings, fingerprint, research_routes, routes_fingerprint, settings
+from .industry import selection
+from .research_models import PROMPT_VERSION
 from .providers import ResearchError
 
 
-def enqueue(kind, job=None, schedule_key=None, session_id=None, automatic=False, profile_id=None):
-    if kind not in {"interactive", "onboard", "scan", "question", "revise", "followup"}:
+TASK_KINDS = {"interactive", "onboard", "question", "revise", "followup", "event_research"}
+TOOL_PROVIDERS = {"deepseek", "zhipu", "moonshot", "compatible"}
+SEARCH_PROVIDERS = TOOL_PROVIDERS - {"compatible"}
+CONTEXT_POLICY_VERSION = 1
+
+
+def enqueue(kind, job=None, schedule_key=None, session_id=None, automatic=False, *, connection=None, brief_id=None):
+    if kind not in TASK_KINDS:
         raise ValueError("研究任务类型无效")
-    profile = get_profile(profile_id)
-    if not profile.chat_verified or (kind != "revise" and not profile.search_verified):
-        raise ValueError("请先完成当前模型的连接和联网测试")
-    if profile.provider not in {"deepseek", "zhipu", "moonshot", "compatible"}:
-        raise ValueError("当前模型适配器未验证原生研究工具调用")
-    if kind in {"scan", "followup"}:
-        state = station.status()
-        if not state["watchlist_confirmed"] or not state["sources_confirmed"]:
-            raise ValueError("请先确认关注名单与资料来源范围")
-        if not station.station_scope()["entities"] and not station.station_scope()["topics"]:
-            raise ValueError("关注范围中没有启用的对象")
-    config = ResearchSettings(**settings()["research"])
+    config = settings()
+    plan, review, write = research_routes(config)
+    for route in (plan, review):
+        if not route.profile.chat_verified:
+            raise ValueError("请先完成深度研究步骤所绑定模型的连接测试")
+        if route.profile.provider not in TOOL_PROVIDERS:
+            raise ValueError("深度研究步骤需要支持原生工具调用的服务商")
+    signature = fingerprint(plan.profile)
     job = dict(job or {})
     scope = job.get("scope") or station.station_scope()
     job["scope"] = scope
-    goal = job.get("main_question") or {"scan": "检查已确认关注范围自上次成功采集以来的变化，寻找有依据的进展、重要条件及需要修订的专题判断。", "onboard": "根据公开原始资料提出最多6家端侧与边缘推理独立 AI 加速器厂商及3个研究专题，并说明关注理由和证据。", "revise": "根据当前全部相关证据重新检查专题认识，分别维护行业竞争与部署决策判断，明确边界和证据缺口。"}.get(kind, "")
+    if kind == "onboard":
+        goal = selection().onboarding_goal
+    elif kind == "revise":
+        goal = job.get("main_question") or "根据已有原文检查专题的行业竞争判断与部署决策，记录支持与反对证据、适用边界和仍待核实的问题。"
+    else:
+        goal = job.get("main_question")
     if not goal:
         raise ValueError("请填写具体的研究目标")
-    job["main_question"] = goal
-    limit_name = "question_requests" if kind == "interactive" else kind + "_requests"
-    limit = getattr(config, limit_name)
-    with db.transaction() as connection:
+    job.update(main_question=goal, prompt_version=PROMPT_VERSION, context_policy_version=CONTEXT_POLICY_VERSION,
+               routes_fingerprint=routes_fingerprint((plan, review, write)))
+    limits = ResearchSettings(**config["research"])
+    limit = limits.followup_requests if automatic and kind == "event_research" else limits.question_requests if kind in {"interactive", "event_research"} else getattr(limits, kind + "_requests")
+    profile = plan.profile
+    with (db.transaction() if connection is None else nullcontext(connection)) as connection:
+        if kind == "event_research" and not session_id:
+            existing = connection.execute("SELECT id FROM tasks WHERE kind='event_research' AND status IN ('queued','running') AND json_extract(job_json,'$.target_id')=? AND automatic=? LIMIT 1", (job["target_id"], int(automatic))).fetchone()
+            if existing:
+                return existing[0]
         if schedule_key:
             old = connection.execute("SELECT id FROM tasks WHERE schedule_key=?", (schedule_key,)).fetchone()
             if old:
@@ -45,7 +61,7 @@ def enqueue(kind, job=None, schedule_key=None, session_id=None, automatic=False,
                 raise ValueError("该会话已有研究正在执行，请等待完成或取消任务")
         else:
             session_id = connection.execute("INSERT INTO research_sessions(title,purpose,scope_json,created_at,updated_at) VALUES(?,?,?,?,?)", (goal[:160], job.get("purpose", "行业竞争"), station.encode(scope), db.now(), db.now())).lastrowid
-        cursor = connection.execute("INSERT INTO tasks(kind,status,prompt,profile_id,profile_fingerprint,provider,model,created_at,job_json,schedule_key,session_id,automatic,priority,request_limit) VALUES(?,'queued',?,?,?,?,?,?,?,?,?,?,?,?)", (kind, goal, profile.id, fingerprint(profile), profile.provider, profile.model, db.now(), station.encode(job), schedule_key, session_id, int(automatic), 0 if automatic else 10, limit))
+        cursor = connection.execute("INSERT INTO tasks(kind,status,prompt,profile_id,profile_fingerprint,provider,model,created_at,job_json,schedule_key,session_id,automatic,priority,request_limit,context_brief) VALUES(?,'queued',?,?,?,?,?,?,?,?,?,?,?,?,?)", (kind, goal, profile.id, signature, profile.provider, profile.model, db.now(), station.encode(job), schedule_key, session_id, int(automatic), 0 if automatic else 10, limit, brief_id))
         identifier = cursor.lastrowid
         if job.get("topic_id"):
             connection.execute("UPDATE tasks SET topic_id=? WHERE id=?", (job["topic_id"], identifier))
@@ -54,15 +70,43 @@ def enqueue(kind, job=None, schedule_key=None, session_id=None, automatic=False,
     return identifier
 
 
+def topic_job(topic):
+    target = {key: topic[key] for key in ("id", "title", "question")}
+    return {"topic_id": target["id"], "target_kind": "topic", "target_id": target["id"],
+            "scope": {"topics": [target], "entities": []}}
+
+
+def enqueue_gap(gap, connection, *, automatic=False):
+    if gap["status"] == "running":
+        raise ValueError("该问题已经在研究中")
+    job = {"main_question": gap["question"], "completion": gap["completion"], "target_kind": gap["target_kind"],
+           "target_id": gap["target_id"], "gap_id": gap["id"]}
+    if gap["target_kind"] == "topic":
+        topic = connection.execute("SELECT id,title,question FROM topics WHERE id=?", (gap["target_id"],)).fetchone()
+        if topic:
+            job.update(topic_job(topic))
+    elif gap["target_kind"] == "entity":
+        entity = connection.execute("SELECT id,name,kind FROM entities WHERE id=?", (gap["target_id"],)).fetchone()
+        if entity:
+            job["scope"] = {"topics": [], "entities": [dict(entity)]}
+    identifier = enqueue("followup", job, automatic=automatic, connection=connection,
+                         schedule_key=f"gap:{gap['id']}:{gap['attempts']}" if automatic else None)
+    connection.execute("UPDATE research_gaps SET task_id=?,status='running',attempts=attempts+1,updated_at=? WHERE id=?",
+                       (identifier, db.now(), gap["id"]))
+    return identifier
+
+
 def retry(task_id):
     task = db.one("SELECT * FROM tasks WHERE id=?", (task_id,))
-    if not task or task["status"] not in {"failed", "interrupted", "cancelled"}:
+    if not task or not task["session_id"] or task["kind"] not in TASK_KINDS or task["status"] not in {"failed", "interrupted", "cancelled"}:
         raise ValueError("该任务当前不能继续处理")
-    if fingerprint(get_profile(task["profile_id"])) != task["profile_fingerprint"]:
-        raise ValueError("模型配置已发生变化，请创建新任务")
+    check_routes(task)
     if db.one("SELECT count(*) AS n FROM usage WHERE task_id=?", (task_id,))["n"] >= (task["request_limit"] or settings()["limits"]["task_requests"]):
         raise ValueError("本任务的请求额度已经用尽")
     with db.transaction() as connection:
+        active = connection.execute("SELECT id FROM tasks WHERE status IN ('queued','running') AND (session_id=? OR topic_id=?) LIMIT 1", (task["session_id"], task["topic_id"])).fetchone()
+        if active:
+            raise ValueError("该研究会话或专题已有任务")
         for operation in connection.execute("SELECT * FROM research_operations WHERE task_id=?", (task_id,)).fetchall():
             if any(marker in operation["operation_key"] for marker in (":truncated:", ":invalid:")):
                 continue
@@ -88,63 +132,55 @@ def save_gap(gap, task, evidence_ids):
         db.execute("UPDATE research_gaps SET evidence_json=?,updated_at=? WHERE id=?", (station.encode(combined), db.now(), existing["id"]))
         return existing["id"]
     identity = hashlib.sha256(station.encode([station.normalized(gap.question), gap.target_kind, gap.target_id]).encode()).hexdigest()
-    scope = station.decode(task["job_json"]).get("scope", {})
-    allowed_topics = {item["id"] for item in scope.get("topics", [])}
-    allowed_entities = {item["id"] for item in scope.get("entities", [])}
-    scoped = (gap.target_kind == "topic" and gap.target_id in allowed_topics) or (gap.target_kind == "entity" and gap.target_id in allowed_entities)
-    automatic = bool(evidence_ids) and (scoped or (gap.target_kind == "domain" and task["kind"] in {"scan", "followup"}))
     with db.transaction() as connection:
         previous = connection.execute("SELECT evidence_json FROM research_gaps WHERE identity_key=?", (identity,)).fetchone()
         combined = list(dict.fromkeys((station.decode(previous[0]) if previous else []) + evidence_ids))
-        connection.execute("INSERT INTO research_gaps(identity_key,question,reason,completion,priority,target_kind,target_id,origin_task_id,evidence_json,next_check_at,automatic_allowed,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(identity_key) DO UPDATE SET reason=excluded.reason,priority=max(priority,excluded.priority),evidence_json=excluded.evidence_json,updated_at=excluded.updated_at", (identity, gap.question, gap.reason, gap.completion, gap.priority, gap.target_kind, gap.target_id, task["id"], station.encode(combined), db.now(), int(automatic), db.now(), db.now()))
+        connection.execute("INSERT INTO research_gaps(identity_key,question,reason,completion,priority,target_kind,target_id,origin_task_id,evidence_json,next_check_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(identity_key) DO UPDATE SET reason=excluded.reason,priority=max(priority,excluded.priority),evidence_json=excluded.evidence_json,updated_at=excluded.updated_at", (identity, gap.question, gap.reason, gap.completion, gap.priority, gap.target_kind, gap.target_id, task["id"], station.encode(combined), db.now(), db.now(), db.now()))
         return connection.execute("SELECT id FROM research_gaps WHERE identity_key=?", (identity,)).fetchone()[0]
 
 
-def schedule_followups():
-    state = station.status()
-    if not state["auto_enabled"] or not state["watchlist_confirmed"] or not state["sources_confirmed"]:
-        return
-    config = ResearchSettings(**settings()["research"])
-    if db.one("SELECT id FROM tasks WHERE status IN ('queued','running') LIMIT 1"):
-        return
-    day = station.local_day()
-    count = db.one("SELECT count(*) AS n FROM tasks WHERE kind IN ('followup','revise') AND automatic=1 AND substr(datetime(created_at,'+8 hours'),1,10)=?", (day,))["n"]
-    used = db.one("SELECT count(*) AS n FROM usage u JOIN tasks t ON t.id=u.task_id WHERE u.day=? AND t.automatic=1", (day,))["n"]
-    total = db.one("SELECT count(*) AS n FROM usage WHERE day=?", (day,))["n"]
-    if count >= config.followups_per_day or used + config.followup_requests > config.automatic_daily_requests or total + config.followup_requests > settings()["limits"]["daily_requests"]:
-        return
-    gap = db.one("SELECT * FROM research_gaps WHERE status IN ('open','deferred') AND automatic_allowed=1 AND next_check_at<=? ORDER BY priority DESC,attempts,id LIMIT 1", (db.now(),))
-    if not gap:
-        pending = db.query("SELECT c.id FROM document_chunks c JOIN document_versions v ON v.id=c.version_id JOIN document_task_links l ON l.document_id=v.document_id JOIN tasks t ON t.id=l.task_id WHERE c.processing_state='pending' AND t.kind IN ('scan','followup') GROUP BY c.id ORDER BY c.id LIMIT ?", (config.context_chunks,))
-        if pending:
-            enqueue("revise", {"main_question": "整理本机已取得但尚未核验整理的原文片段，提取对确认关注领域有价值的事实、术语、条件和后续问题。只使用已有资料。", "chunk_ids": [row["id"] for row in pending]}, automatic=True)
-        return
-    if gap["target_kind"] == "topic" and not db.one("SELECT id FROM topics WHERE id=? AND research_state='active'", (gap["target_id"],)):
-        return
-    if gap["target_kind"] == "entity" and not db.one("SELECT id FROM entities WHERE id=? AND followed=1 AND state='active'", (gap["target_id"],)):
-        return
-    identifier = enqueue("followup", {"main_question": gap["question"], "completion": gap["completion"], "target_kind": gap["target_kind"], "target_id": gap["target_id"], "gap_id": gap["id"]}, schedule_key=f"gap:{gap['id']}:{gap['attempts']}", automatic=True)
-    db.execute("UPDATE research_gaps SET task_id=?,status='running',attempts=attempts+1,updated_at=? WHERE id=?", (identifier, db.now(), gap["id"]))
+def check_routes(task, config=None):
+    job = station.decode(task["job_json"])
+    routes = research_routes(config, profile_id=None if "routes_fingerprint" in job else task["profile_id"])
+    if fingerprint(routes[0].profile) != task["profile_fingerprint"]:
+        raise ValueError("研究规划使用的模型配置已经变更，请创建新任务")
+    if "routes_fingerprint" in job and routes_fingerprint(routes) != job["routes_fingerprint"]:
+        raise ValueError("研究步骤的模型、思考强度或输出上限已变更，请创建新任务")
+    return routes
+
+
+def enqueue_event(event_id, *, automatic=False):
+    event = db.one("SELECT id,title FROM events WHERE id=? AND state='active' AND canonical_event_id IS NULL", (event_id,))
+    if not event:
+        raise ValueError("事件不存在或已归档")
+    scope = station.station_scope()
+    scope["entities"] = db.query("SELECT x.id,x.name,x.kind FROM event_entities ee JOIN entities x ON x.id=ee.entity_id WHERE ee.event_id=? AND x.state!='archived'", (event_id,))
+    related = db.query("SELECT t.id,t.title,t.question FROM event_topics et JOIN topics t ON t.id=et.topic_id WHERE et.event_id=? AND t.research_state='active'", (event_id,))
+    if related:
+        scope["topics"] = related
+    job = {"target_kind": "event", "target_id": event_id, "scope": scope,
+           "main_question": f"核验事件《{event['title']}》，说明已经确认的进展、适用条件和仍缺少的依据。",
+           "completion": "把关键说法关联到一手原文及其他可用资料，区分厂商陈述、独立证据、分析判断和待核实信息。"}
+    return enqueue("event_research", job, schedule_key=f"event-research:{event_id}" if automatic else None, automatic=automatic)
 
 
 def finish_gap(task, complete):
     job = station.decode(task["job_json"])
     if job.get("gap_id"):
-        gap = db.one("SELECT status FROM research_gaps WHERE id=?", (job["gap_id"],))
-        if gap and gap["status"] == "paused":
-            return
         next_check = datetime.now(timezone.utc) + timedelta(days=7 if not complete else 365)
-        db.execute("UPDATE research_gaps SET status=?,next_check_at=?,updated_at=? WHERE id=?", ("resolved" if complete else "deferred", next_check.isoformat(timespec="seconds"), db.now(), job["gap_id"]))
+        db.execute("UPDATE research_gaps SET status=?,next_check_at=?,updated_at=? WHERE id=? AND task_id=? AND status!='paused'",
+                   ("resolved" if complete else "deferred", next_check.isoformat(timespec="seconds"), db.now(), job["gap_id"], task["id"]))
 
 
 def feedback(session_id, task_id, kind, body="", item_id=None):
     if kind not in {"useful", "irrelevant", "incorrect", "outdated"}:
         raise ValueError("反馈类型无效")
-    task = db.one("SELECT result_json FROM tasks WHERE id=? AND session_id=?", (task_id, session_id))
+    task = db.one("SELECT result_json,job_json FROM tasks WHERE id=? AND session_id=?", (task_id, session_id))
     if not task:
         raise ValueError("研究结果不存在")
     result = station.decode(task["result_json"])
-    identifiers = list({item["id"] for item in (continuity.canonical_knowledge(identifier) for identifier in result.get("knowledge_ids", [])) if item})
+    private = bool(station.decode(task["job_json"]).get("selected_note_ids"))
+    identifiers = [] if private else list({item["id"] for item in (continuity.canonical_knowledge(identifier) for identifier in result.get("knowledge_ids", [])) if item})
     if item_id is not None:
         item = continuity.canonical_knowledge(item_id)
         if not item:
@@ -153,6 +189,8 @@ def feedback(session_id, task_id, kind, body="", item_id=None):
     if item_id is not None and item_id not in identifiers:
         raise ValueError("知识编号不属于该研究结果")
     db.execute("INSERT INTO research_feedback(session_id,task_id,item_id,kind,body,created_at) VALUES(?,?,?,?,?,?)", (session_id, task_id, item_id, kind, body, db.now()))
+    if private:
+        return
     documents = set(result.get("document_ids", []))
     for experience in db.query("SELECT id,document_ids_json FROM research_experiences"):
         if documents & set(station.decode(experience["document_ids_json"])):

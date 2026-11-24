@@ -2,8 +2,8 @@
 {% from 'macros.html' import token with context %}
 {% from 'ui.html' import icon, kind_icon, page_header %}
 {% block content %}
-{% call page_header('Watchlist', '关注与更新设置', '确认关注对象、资料范围、模型额度与更新时间。完成确认后可手动采集。') %}
-  <a class="button" href="/settings">{{ icon('sliders') }}模型与额度</a>
+{% call page_header('', '关注与更新设置', '维护厂商与专题关注名单，并设置自动轮询和日报时间。') %}
+  <a class="button" href="/admin/sources">{{ icon('link') }}管理信源</a>
 {% endcall %}
 
 <section class="status-strip" aria-label="关注设置状态">
@@ -15,16 +15,12 @@
     <span class="status-label">{{ icon('refresh') }}自动更新</span>
     <span class="status-value"><span class="badge dot tone-{{ 'success' if station.auto_enabled else 'neutral' }}">{{ '已启用' if station.auto_enabled else '待配置' }}</span></span>
   </div>
-  <div class="status-cell status-cell-wide">
-    <span class="status-label">{{ icon('database') }}资料范围</span>
-    <span class="status-value">{{ coverage.source_scope if coverage.source_scope else '尚未确认' }}</span>
-  </div>
 </section>
 
 <div class="layout-split">
   <div class="stack">
     <section class="panel">
-      <div class="panel-head"><h2>{{ icon('spark') }}AI 提议的关注对象</h2><form action="/watchlist/propose" method="post">{{ token() }}<button class="button small" type="submit">{{ icon('search') }}联网生成候选名单</button></form></div>
+      <div class="panel-head"><h2>{{ icon('spark') }}AI 提议的关注对象</h2><form action="/watchlist/propose" method="post">{{ token() }}<button class="button small" type="submit">{{ icon('search') }}研究候选关注对象</button></form></div>
       <p class="panel-note">建议约 6 家厂商和 3 个专题；每项附原始资料。请核对后选择，可在下方手动补充。</p>
       <form action="/watchlist/confirm" method="post" class="stack-form section-space">{{ token() }}
         {% if proposals %}
@@ -32,14 +28,7 @@
           {% for proposal in proposals %}<label class="proposal-row"><input type="checkbox" name="proposal_id" value="{{ proposal.id }}" {{ 'checked' if proposal.status=='accepted' else '' }}><span class="proposal-body"><strong>{{ '厂商' if proposal.kind=='company' else '专题' }} · {{ proposal.name }}</strong><small>{{ proposal.reason }}</small><small>依据：<a href="{{ proposal.document_url }}" target="_blank" rel="noopener noreferrer">{{ proposal.document_title }}{{ icon('external') }}</a></small></span></label>{% endfor %}
         </div>
         {% else %}<p class="muted">尚无候选名单。生成后在此核对来源与选择关注对象。</p>{% endif %}
-        <div class="form-section">
-          <h3 class="form-section-title">采集条件</h3>
-          <label>资料来源范围<textarea name="source_scope" rows="3" required maxlength="1000">{{ coverage.source_scope if coverage.source_scope else '优先厂商官网、产品文档、SDK 发布记录、官方代码仓库和原始商业公告；二手资料只作为线索。' }}</textarea></label>
-          <label>每日计划时间（Asia/Shanghai）<input type="time" name="schedule_time" value="{{ station.schedule_time }}" required></label>
-          <label class="check-row"><input type="checkbox" name="confirm_sources" value="yes" required><span>我已确认资料来源范围</span></label>
-          <label class="check-row"><input type="checkbox" name="confirm_model_budget" value="yes" required><span>我已检查当前模型与调用额度</span></label>
-        </div>
-        <div class="form-actions"><button class="button primary" type="submit">{{ icon('check') }}确认关注名单与采集条件</button></div>
+        <div class="form-actions"><button class="button primary" type="submit">{{ icon('check') }}保存关注名单</button></div>
       </form>
     </section>
     <section class="panel">
@@ -62,13 +51,13 @@
     </section>
     <section class="panel">
       <div class="panel-head"><h2>{{ icon('clock') }}持续更新</h2></div>
-      <p class="panel-note">后台 worker 在浏览器关闭时继续运行。任务到期后执行一次检查，最近成功结果会保留。</p>
+      <p class="panel-note">启用自动更新即确认使用当前启用的信源。后台按各信源的间隔轮询，并每天刷新简报。</p>
       <form action="/watchlist/automation" method="post" class="stack-form section-space">{{ token() }}
-        <label class="check-row"><input type="checkbox" name="enabled" value="yes" {{ 'checked' if station.auto_enabled else '' }}><span>启用每日自动采集</span></label>
-        <label>执行时间<input type="time" name="schedule_time" value="{{ station.schedule_time }}" required></label>
+        <label class="check-row"><input type="checkbox" name="enabled" value="yes" {{ 'checked' if station.auto_enabled else '' }}><span>启用自动轮询与日报</span></label>
+        <label>日报时间<input type="time" name="schedule_time" value="{{ station.schedule_time }}" required></label>
         <button class="button" type="submit">{{ icon('check') }}保存更新设置</button>
       </form>
-      <p class="field-help section-space">当前状态：{{ '自动更新已启用' if station.auto_enabled else '手动维护中 · 自动更新待配置' }}。下次计划：<span class="mono">{{ station.next_run|localtime if station.next_run else '未设置' }}</span></p>
+      <p class="field-help section-space">当前状态：{{ '自动更新已启用' if station.auto_enabled else '手动维护中 · 自动更新待配置' }}。下次日报：<span class="mono">{{ station.next_run|localtime if station.next_run else '未设置' }}</span></p>
     </section>
   </aside>
 </div>

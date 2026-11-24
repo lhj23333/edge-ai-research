@@ -10,11 +10,11 @@
     <div class="panel-head"><h2>{{ icon('spark') }}选择研究动作</h2><span class="panel-note">选择后自动填写问题范围</span></div>
     <nav class="action-grid" aria-label="研究动作">
       {% for value,label,symbol in [('verify','核实这项说法','shield'),('explain','解释这次更新','spark'),('compare','检查部署条件','chip'),('update','检查专题判断','refresh'),('gap','调查证据缺口','search')] %}
-      <a class="action-card {{ 'is-active' if action == value else '' }}" href="/questions?target_kind={{ target_kind }}&target_id={{ target_id }}&event_id={{ event_id }}&claim_id={{ claim_id }}&action={{ value }}" {% if action == value %}aria-current="true"{% endif %}>{{ icon(symbol) }}<span>{{ label }}</span></a>
+      <a class="action-card {{ 'is-active' if action == value else '' }}" href="/questions?target_kind={{ target_kind }}{% if target_id %}&target_id={{ target_id }}{% endif %}{% if event_id %}&event_id={{ event_id }}{% endif %}{% if claim_id %}&claim_id={{ claim_id }}{% endif %}&action={{ value }}" {% if action == value %}aria-current="true"{% endif %}>{{ icon(symbol) }}<span>{{ label }}</span></a>
       {% endfor %}
     </nav>
 
-    <form action="/questions" method="post" class="stack-form section-space">{{ token() }}<input type="hidden" name="event_id" value="{{ event_id }}"><input type="hidden" name="claim_id" value="{{ claim_id }}">
+    <form action="/questions" method="post" class="stack-form section-space">{{ token() }}<input type="hidden" name="event_id" value="{{ event_id or '' }}"><input type="hidden" name="claim_id" value="{{ claim_id or '' }}">
       <div class="form-section">
         <h3 class="form-section-title">研究对象</h3>
         <div class="field-row">

@@ -30,7 +30,7 @@
       <div class="panel-head"><h2>{{ icon('evidence') }}关联说法与核验</h2><span class="panel-note mono">{{ claims|length }} 条</span></div>
       {{ evidence_cards(claims) }}
     </section>
-    {% if evidence_checks %}<section class="panel"><div class="panel-head"><h2>{{ icon('shield') }}模型对原文支持程度的核验</h2></div><p class="panel-note">下列结果来自模型核验，人工核验状态见关联说法。</p><div class="list">{% for check in evidence_checks %}<article class="list-item"><strong>{{ check.statement }}</strong><p>{{ check.reason }}</p><small>{{ {'supported':'原文支持','partial':'部分支持','contradicted':'原文存在矛盾','insufficient':'依据不足'}.get(check.verdict,check.verdict) }} · <a href="/documents/{{ document.id }}?version={{ check.version_id }}#chunk-{{ check.chunk_id }}">片段 {{ check.chunk_id }} · 版本 {{ check.version_id }}</a></small></article>{% endfor %}</div></section>{% endif %}
+    {% if evidence_checks %}<section class="panel"><div class="panel-head"><h2>{{ icon('shield') }}原文片段及其支持程度</h2></div><div class="list">{% for check in evidence_checks %}<article class="list-item"><strong>{{ check.statement }}</strong><p>{{ check.reason }}</p><small>{{ {'supported':'原文支持','partial':'部分支持','contradicted':'原文存在矛盾','insufficient':'依据不足'}.get(check.verdict,check.verdict) }} · <a href="/documents/{{ document.id }}?version={{ check.version_id }}#chunk-{{ check.chunk_id }}">片段 {{ check.chunk_id }} · 版本 {{ check.version_id }}</a></small></article>{% endfor %}</div></section>{% endif %}
   </div>
   <aside class="panel">
     <div class="panel-head"><h2>{{ icon('layers') }}资料版本</h2><span class="panel-note mono">{{ versions|length }}</span></div>

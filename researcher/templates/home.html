@@ -1,9 +1,9 @@
 {% extends 'base.html' %}
 {% from 'macros.html' import token, task_badge with context %}
-{% from 'ui.html' import icon, page_header, empty, signal, bar, stack_bar, spark_bars %}
+{% from 'ui.html' import icon, page_header, empty, bar, stack_bar, spark_bars %}
 {% block content %}
 {% set run_states = {'complete':'已完成','partial':'部分完成','failed':'采集失败','running':'进行中','never':'未运行'} %}
-{% call page_header('Industry briefing · ' ~ (station.last_attempt_at|localtime if station.last_attempt_at else '等待首次采集'), '今日简报', '端侧与边缘推理独立 AI 加速器的变化、影响与待核实问题。') %}
+{% call page_header(day, '今日简报', '端侧与边缘推理独立 AI 加速器的变化、影响与待核实问题。') %}
   <a class="button" href="/compare{{ '?' ~ compare_query if compare_query else '' }}">{{ icon('bars') }}比较产品</a>
   <a class="button primary" href="/updates">查看全部动态{{ icon('arrow-right') }}</a>
 {% endcall %}
@@ -14,8 +14,8 @@
     <strong class="status-value">{{ '自动更新已启用' if station.auto_enabled else '手动维护中 · 自动更新待配置' }}</strong>
   </div>
   <div class="status-cell">
-    <span class="status-label">{{ icon('calendar') }}本期覆盖</span>
-    <span class="status-value mono">{{ issue.coverage_start|localtime if issue and issue.coverage_start else '尚无' }} — {{ issue.coverage_end|localtime if issue else '尚无' }}</span>
+    <span class="status-label">{{ icon('calendar') }}简报日期</span>
+    <span class="status-value mono">{{ day }} · {{ events|length }} 件</span>
   </div>
   <div class="status-cell">
     <span class="status-label">{{ icon('check-circle') }}最近成功更新</span>
@@ -26,8 +26,8 @@
     <span class="status-value"><span class="mono">{{ station.last_attempt_at|localtime if station.last_attempt_at else '尚未开始' }}</span><span class="badge dot tone-{{ station.last_status|tone }}">{{ run_states.get(station.last_status, station.last_status) }}</span></span>
   </div>
 </section>
-{% if station.last_status=='failed' %}<div class="alert tone-danger">{{ icon('alert') }}<p>最近一次采集失败：{{ station.last_error }}。下方保留最近已保存的简报；最近成功更新时间见上方。</p></div>
-{% elif station.last_status=='partial' %}<div class="alert tone-warning">{{ icon('info') }}<p>本次只完成部分资料范围。已保存的变化可阅读；未覆盖范围见<a href="/updates">采集记录</a>。</p></div>{% endif %}
+{% if station.last_status=='failed' %}<div class="alert tone-danger">{{ icon('alert') }}<p>最近一次采集失败。{{ station.last_error }} 已保存的事件仍可阅读。</p></div>
+{% elif station.last_status=='partial' %}<div class="alert tone-warning">{{ icon('info') }}<p>部分信源抓取失败。查看<a href="/admin/sources">信源状态</a>。</p></div>{% endif %}
 
 <section class="kpi-grid" aria-label="研究数据概览">
   <a class="kpi" href="/companies?kind={{ '产品'|urlencode }}">
@@ -66,7 +66,7 @@
 <section class="panel catchup" id="catchup">
   <div class="panel-head"><h2>{{ icon('spark') }}自上次访问以来</h2><span class="badge tone-accent">{{ catchup_events|length }} 项事件 · {{ catchup_revisions|length }} 次判断修订</span></div>
   <div class="list">
-    {% for item in catchup_events[:5] %}<a class="list-item" href="/events/{{ item.id }}"><strong>{{ item.title }}</strong><small class="mono">{{ item.created_at|localtime }}</small></a>{% endfor %}
+    {% for item in catchup_events %}<a class="list-item" href="/events/{{ item.id }}"><strong>{{ item.title }}</strong><small class="mono">{{ item.visible_at|localtime }}</small></a>{% endfor %}
     {% for item in catchup_revisions[:5] %}<a class="list-item" href="/knowledge/{{ item.topic_id }}"><strong>{{ item.topic_title }}：{{ item.reason }}</strong><small class="mono">{{ item.created_at|localtime }}</small></a>{% endfor %}
   </div>
 </section>
@@ -83,8 +83,8 @@
           <div class="event-meta">
             <span class="badge tone-accent">{{ event.event_type }}</span>
             <time class="mono">{{ (event.occurred_at or event.published_at or event.created_at)[:10] }}</time>
-            {% if event.background %}<span class="badge">背景资料</span>{% endif %}
-            {{ signal(event.importance) }}
+            {% if event.get('first_party_confirmed') %}<span class="badge tone-success">T1 一手</span>{% endif %}
+            {% if event.get('independent_source_count') is not none %}<span class="event-count">近 48 小时 {{ event.independent_source_count }} 个独立来源</span>{% endif %}
           </div>
           <h3><a href="/events/{{ event.id }}">{{ event.title }}</a></h3>
           <dl class="event-facts">
@@ -92,23 +92,14 @@
             <div><dt>为什么重要</dt><dd>{{ event.why_important }}</dd></div>
             {% if event.competitive_impact %}<div><dt>竞争影响</dt><dd>{{ event.competitive_impact }}</dd></div>{% endif %}
           </dl>
-          <a class="text-link" href="/events/{{ event.id }}">阅读证据与专题影响{{ icon('arrow-right') }}</a>
+          <div class="actions"><a class="text-link" href="/events/{{ event.id }}">阅读证据与专题影响{{ icon('arrow-right') }}</a>{% if event.get('representative_url') and event.get('representative_document_id') %}<a class="text-link" href="/documents/{{ event.representative_document_id }}">代表原文</a>{% endif %}</div>
         </article>
         {% endfor %}
       </div>
-      {% elif issue and issue.status=='complete' %}
-      {% call empty('本期未发现可记录的重要变化', symbol='check-circle') %}<p>已完成本期关注范围检查。查看<a href="/updates">采集记录</a>了解检索覆盖。</p>{% endcall %}
       {% else %}
-      {% call empty('等待首次有效简报', '确认关注名单、资料来源和模型额度后，可以手动采集。', 'clock') %}<a class="button primary" href="/watchlist">设置关注名单{{ icon('arrow-right') }}</a>{% endcall %}
+      {% call empty('今日暂无入选事件', '新资料通过日期校验、筛选与聚簇后会出现在这里。', 'clock') %}<a class="button" href="/admin/sources">查看信源{{ icon('arrow-right') }}</a>{% endcall %}
       {% endif %}
     </section>
-
-    {% if study_points %}
-    <section aria-labelledby="research-findings-title">
-      <div class="section-title"><h2 id="research-findings-title">{{ icon('search') }}本期研究发现</h2><a class="text-link" href="/research/{{ study_session_id }}">完整研究与后续问题{{ icon('arrow-right') }}</a></div>
-      <div class="stack-sm">{% for point in study_points %}<article class="panel compact"><p class="eyebrow">{{ point.category }}</p><p>{{ point.text }}</p><div class="meta">{% for source in point.sources %}<a href="/documents/{{ source.id }}?version={{ source.version_id }}#chunk-{{ source.chunk_id }}">{{ source.title }}</a>{% endfor %}</div></article>{% endfor %}</div>
-    </section>
-    {% endif %}
 
     <section aria-labelledby="revisions-title">
       <div class="section-title"><h2 id="revisions-title">{{ icon('layers') }}认知更新</h2><a class="text-link" href="/map">认知地图{{ icon('arrow-right') }}</a></div>
@@ -127,9 +118,8 @@
 
     {% if background_events %}
     <section class="panel">
-      <div class="panel-head"><h2>{{ icon('archive') }}本期补充的背景资料</h2></div>
-      <p class="panel-note">以下资料补充行业认识，不计为本期新发生的行业变化。</p>
-      <div class="list section-space">{% for event in background_events %}<a class="list-item" href="/events/{{ event.id }}"><strong>{{ event.title }}</strong><small>事件日期：{{ event.occurred_at or '未明确' }} · 来源发布：{{ event.published_at or '未提供' }}</small></a>{% endfor %}</div>
+      <div class="panel-head"><h2>{{ icon('archive') }}归档背景资料</h2></div>
+      <div class="list">{% for item in background_events %}<a class="list-item" href="{{ item.canonical_url }}" target="_blank" rel="noopener noreferrer"><strong>{{ item.title }}</strong><small>{{ item.tier }} · {{ item.published_at|localtime }}</small></a>{% endfor %}</div>
     </section>
     {% endif %}
   </div>
@@ -194,5 +184,9 @@
     </section>
   </aside>
 </div>
-<form id="reading-visit" action="/reading/visit" method="post" hidden>{{ token() }}</form>
+<form id="reading-visit" action="/reading/visit" method="post" hidden>
+  {{ token() }}
+  <input type="hidden" name="reading_at" value="{{ reading_at }}">
+  <input type="hidden" name="reading_feed_at" value="{{ reading_feed_at or '' }}">
+</form>
 {% endblock %}

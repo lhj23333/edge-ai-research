@@ -1,6 +1,6 @@
 {% extends 'base.html' %}
 {% from 'macros.html' import token with context %}
-{% from 'station_macros.html' import annotation_form with context %}
+{% from 'station_macros.html' import annotation_form, claim_trace with context %}
 {% from 'ui.html' import icon %}
 {% block content %}
 <header class="page-header">
@@ -48,7 +48,7 @@
             <a href="{{ item.url }}" target="_blank" rel="noopener noreferrer">来源{{ icon('external') }}</a>
           </div>
           <div class="meta"><span>发布：<span class="mono">{{ item.published_at or '未提供' }}</span></span><span>获取：<span class="mono">{{ item.last_fetched_at|localtime }}</span></span><span>{{ item.extent }}</span></div>
-          <div class="evidence-actions"><a class="text-link" href="/questions?action=verify&claim_id={{ item.id }}">核实这项说法{{ icon('arrow-right') }}</a></div>
+          <div class="evidence-actions">{{ claim_trace(item) }}<a class="text-link" href="/questions?action=verify&claim_id={{ item.id }}">核实这项说法{{ icon('arrow-right') }}</a></div>
         </article>
         {% else %}<p class="muted">尚无支持或反对证据。</p>{% endfor %}
       </div>

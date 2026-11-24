@@ -14,7 +14,7 @@ from contextlib import ExitStack
 from pathlib import Path
 
 from . import db
-from .config import DATA, ROOT, Limits, Profile, ResearchSettings, config_lock, prepare_data, read_json, write_json
+from .config import DATA, ROOT, Limits, Profile, ResearchSettings, config_lock, model_routes, prepare_data, read_json, write_json
 
 
 def lock_file(name):
@@ -92,6 +92,7 @@ def restore(source, replace=False):
     with ExitStack() as stack:
         stack.enter_context(lock_file("web.lock"))
         stack.enter_context(lock_file("worker.lock"))
+        stack.enter_context(lock_file("index.lock"))
         stack.enter_context(config_lock())
         staging = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix=".restore-", dir=DATA)))
         destination = DATA / "researcher.sqlite3"
@@ -109,6 +110,7 @@ def restore(source, replace=False):
             config = json.loads(archive.read("config.json"))
             Limits(**config.get("limits", {}))
             ResearchSettings(**config.get("research", {}))
+            model_routes(config.get("model_routes", {}))
             for item in config.get("profiles", []):
                 Profile(**item)
                 item["chat_verified"] = None
@@ -129,6 +131,11 @@ def restore(source, replace=False):
             if version >= 4:
                 snapshot.execute("UPDATE research_sessions SET status='interrupted' WHERE status='running'")
                 snapshot.execute("UPDATE research_gaps SET status='deferred' WHERE status='running'")
+            if version >= 7:
+                snapshot.execute("UPDATE feed_runs SET status='interrupted',error='从备份恢复',finished_at=? WHERE status='running'", (db.now(),))
+            if version >= 10:
+                snapshot.execute("UPDATE topic_research_schedules SET next_run=NULL")
+            snapshot.execute("UPDATE usage SET status='interrupted' WHERE status='reserved'")
             snapshot.execute("DELETE FROM runtime")
             snapshot.commit()
             target = sqlite3.connect(destination)
@@ -140,6 +147,8 @@ def restore(source, replace=False):
             snapshot.close()
         destination.chmod(0o600)
         write_json("config.json", config)
+        for name in ("search.sqlite3", "search.sqlite3-wal", "search.sqlite3-shm"):
+            (DATA / name).unlink(missing_ok=True)
         if keys is not None:
             write_json("secrets.json", keys)
     db.initialize()

@@ -1,7 +1,6 @@
 import argparse
-import subprocess
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
@@ -49,22 +48,21 @@ def submit(client, path, values):
 
 def main():
     parser = argparse.ArgumentParser(description="验证当前网站的真实 AI 流程，会产生调用和研究记录")
-    parser.add_argument("--stage", choices=["connection", "search", "research", "question", "revise", "schedule", "cancel", "quota"], default="research")
+    parser.add_argument("--stage", choices=["connection", "search", "collect", "question", "revise", "schedule", "cancel", "quota"], default="collect")
     parser.add_argument("--topic", type=int)
-    parser.add_argument("--simulate-pause", action="store_true")
     arguments = parser.parse_args()
-    profile = get_profile()
     with httpx.Client(trust_env=False, timeout=20) as client:
         client.get(URL + "/settings").raise_for_status()
         if arguments.stage in ("connection", "search"):
-            task_id = submit(client, "/settings/test", {"profile_id": profile.id, "mode": "test_chat" if arguments.stage == "connection" else "test_search"})
+            task_id = submit(client, "/settings/test", {"profile_id": get_profile().id, "mode": "test_chat" if arguments.stage == "connection" else "test_search"})
             wait_task(task_id)
-        elif arguments.stage == "research":
-            task_id = submit(client, "/updates/scan", {})
+        elif arguments.stage == "collect":
+            task_id = submit(client, "/updates/collect", {})
             wait_task(task_id)
-            run = db.one("SELECT id,status FROM collection_runs WHERE task_id=?", (task_id,))
-            assert run and db.one("SELECT id FROM daily_issues WHERE run_id=?", (run["id"],))
-            print({"collection_status": run["status"], "requests": db.one("SELECT count(*) AS n FROM usage WHERE task_id=?", (task_id,))["n"]}, flush=True)
+            runs = db.query("SELECT status,new_count FROM feed_runs WHERE task_id=?", (task_id,))
+            assert runs and db.one("SELECT day FROM daily_briefings LIMIT 1")
+            assert not db.query("SELECT id FROM usage WHERE task_id=? AND operation='search'", (task_id,))
+            print({"feed_runs": runs}, flush=True)
         elif arguments.stage == "revise":
             topic = db.one("SELECT * FROM topics WHERE id=?", (arguments.topic,)) if arguments.topic else db.one("SELECT * FROM topics WHERE research_state='active' ORDER BY id LIMIT 1")
             if not topic:
@@ -72,7 +70,7 @@ def main():
             task_id = submit(client, f"/knowledge/{topic['id']}/revise", {})
             wait_task(task_id)
             result = station.decode(db.one("SELECT result_json FROM tasks WHERE id=?", (task_id,))["result_json"])
-            print({"topic": topic["id"], "revisions": len(result["revision_ids"]), "questions": len(result["questions"])}, flush=True)
+            print({"topic": topic["id"], "revisions": len(result["revision_ids"]), "questions": len(result["gap_ids"])}, flush=True)
         elif arguments.stage == "question":
             topic = db.one("SELECT * FROM topics WHERE id=?", (arguments.topic,)) if arguments.topic else db.one("SELECT * FROM topics WHERE research_state='active' ORDER BY id LIMIT 1")
             if not topic:
@@ -83,44 +81,29 @@ def main():
             assert result["document_ids"]
             print({"complete": result["complete"], "sources": len(result["document_ids"]), "uncertainties": len(result["uncertainties"])}, flush=True)
         elif arguments.stage == "schedule":
-            if db.one("SELECT id FROM tasks WHERE status IN ('queued','running') LIMIT 1"):
-                raise RuntimeError("存在执行中的任务，请等待完成")
             original = station.status()
-            clock = (datetime.now(ZoneInfo("Asia/Shanghai")) + timedelta(minutes=1)).strftime("%H:%M")
-            latest_id = db.one("SELECT coalesce(max(id),0) AS id FROM tasks")["id"]
-            task_id = None
+            zone = ZoneInfo(settings()["limits"]["timezone"])
+            clock = (datetime.now(zone) + timedelta(minutes=1)).strftime("%H:%M")
             try:
                 response = client.post(URL + "/watchlist/automation", data={"csrf": client.cookies["researcher_csrf"], "enabled": "yes", "schedule_time": clock})
-                assert response.status_code == 303
-                due = datetime.fromisoformat(station.status()["next_run"])
-                print(f"单次调度验证已设置：{clock}，没有打开浏览器。", flush=True)
-                if arguments.simulate_pause:
-                    subprocess.run(["systemctl", "--user", "stop", "researcher-worker"], check=True)
-                    try:
-                        while datetime.now(timezone.utc) <= due + timedelta(seconds=2):
-                            time.sleep(1)
-                    finally:
-                        subprocess.run(["systemctl", "--user", "start", "researcher-worker"], check=True)
+                assert response.status_code == 303, response.text
+                due = station.status()["next_run"]
+                if not due:
+                    raise RuntimeError("请先启用至少一个信源")
                 deadline = time.monotonic() + 100
                 while time.monotonic() < deadline:
-                    scheduled = db.one("SELECT id FROM tasks WHERE id>? AND kind='scan' AND schedule_key IS NOT NULL ORDER BY id LIMIT 1", (latest_id,))
-                    if scheduled:
-                        task_id = scheduled["id"]
+                    if db.one("SELECT day FROM daily_briefings WHERE created_at>=? LIMIT 1", (due,)) and station.status()["next_run"] > due:
                         break
                     time.sleep(1)
-                if not task_id:
-                    raise RuntimeError("到期检查没有入队")
+                else:
+                    raise RuntimeError("规则日报未在到期后生成")
             finally:
                 restore = {"csrf": client.cookies["researcher_csrf"], "schedule_time": original["schedule_time"]}
                 if original["auto_enabled"]:
                     restore["enabled"] = "yes"
                 assert client.post(URL + "/watchlist/automation", data=restore).status_code == 303
-                print("更新设置已恢复。", flush=True)
-            wait_task(task_id)
-            assert db.one("SELECT count(*) AS n FROM tasks WHERE id>? AND schedule_key IS NOT NULL", (latest_id,))["n"] == 1
-            print({"scheduled_task": task_id, "requests": db.one("SELECT count(*) AS n FROM usage WHERE task_id=?", (task_id,))["n"]}, flush=True)
         elif arguments.stage == "cancel":
-            task_id = submit(client, "/settings/test", {"profile_id": profile.id, "mode": "test_chat"})
+            task_id = submit(client, "/settings/test", {"profile_id": get_profile().id, "mode": "test_chat"})
             assert client.post(URL + f"/tasks/{task_id}/cancel", data={"csrf": client.cookies["researcher_csrf"]}).status_code == 303
             for _ in range(30):
                 if db.one("SELECT status FROM tasks WHERE id=?", (task_id,))["status"] == "cancelled":
@@ -138,7 +121,7 @@ def main():
             changed = {**original, "daily_requests": before}
             try:
                 assert client.post(URL + "/settings/limits", data={"csrf": client.cookies["researcher_csrf"], **changed}).status_code == 303
-                task_id = submit(client, "/settings/test", {"profile_id": profile.id, "mode": "test_chat"})
+                task_id = submit(client, "/settings/test", {"profile_id": get_profile().id, "mode": "test_chat"})
                 for _ in range(30):
                     task = db.one("SELECT status,error FROM tasks WHERE id=?", (task_id,))
                     if task["status"] == "failed":

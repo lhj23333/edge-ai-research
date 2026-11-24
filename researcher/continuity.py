@@ -31,10 +31,10 @@ def measurement_units(value):
 
 def canonical_url(value):
     parts = urlsplit(value)
-    hostname = (parts.hostname or "").lower()
-    if parts.scheme not in {"http", "https"} or not hostname or parts.username or parts.password:
+    hostname = (parts.hostname or "").lower().rstrip(".")
+    if parts.scheme not in {"http", "https"} or not hostname or parts.username is not None or parts.password is not None:
         raise ValueError("资料链接必须是不含凭据的 HTTP 或 HTTPS 地址")
-    host = f"[{hostname}]" if ":" in hostname else hostname
+    host = f"[{hostname}]" if ":" in hostname else hostname.encode("idna").decode()
     if parts.port and (parts.scheme, parts.port) not in {("http", 80), ("https", 443)}:
         host += ":" + str(parts.port)
     pairs = parse_qsl(parts.query, keep_blank_values=True)
@@ -69,7 +69,7 @@ def query_guards(query):
 
 async def cached_operation(kind, inputs, context, task_id, produce, force=False, reuse_key=None):
     from .config import settings
-    from .providers import ResearchError, UnknownOutcome
+    from .providers import ResearchError, UnknownOutcome, YieldResearch
     context_key = digest(context)
     cache_key = digest([kind, inputs, context_key])
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=settings()["research"]["query_cache_hours"])).isoformat()
@@ -107,6 +107,9 @@ async def cached_operation(kind, inputs, context, task_id, produce, force=False,
             continue
         try:
             result = await produce(cache_key)
+        except YieldResearch:
+            db.execute("UPDATE research_cache SET status='retry_pending',updated_at=? WHERE cache_key=? AND task_id=?", (db.now(), cache_key, task_id))
+            raise
         except BaseException as error:
             status = "unknown" if isinstance(error, (UnknownOutcome, asyncio.CancelledError)) else "failed"
             message = str(error) if isinstance(error, ResearchError) else "操作失败（" + type(error).__name__ + "）"
@@ -143,7 +146,7 @@ def condition_values(value):
 
 def compatible_conditions(left, right, reviewed=False):
     left, right = fact_conditions(left), fact_conditions(right)
-    # 表述不同的条件只有在模型明确核验为相同事实后才能合并；数值与系统差异仍阻止合并。
+    # 合并不同表述需要核验条件等价，且数值和系统一致。
     return all(left[key] == right[key] or (reviewed and condition_values(left[key]) == condition_values(right[key])) for key in left.keys() & right.keys())
 
 
@@ -165,7 +168,7 @@ def merge_knowledge(canonical_id, duplicate_id, reason):
     with db.transaction() as connection:
         connection.execute("INSERT OR IGNORE INTO knowledge_evidence SELECT ?,claim_id FROM knowledge_evidence WHERE item_id=?", (canonical_id, duplicate_id))
         connection.execute("INSERT OR IGNORE INTO knowledge_facets SELECT ?,facet_key,kind,conditions_json,topic_id,entity_id FROM knowledge_facets WHERE item_id=?", (canonical_id, duplicate_id))
-        # 历史纠错状态继续约束合并后的知识，不能因增加来源而恢复为已支持。
+        # 合并新增来源时保留原有纠错状态。
         status = "needs_review" if "needs_review" in {canonical["status"], duplicate["status"]} else canonical["status"]
         revision = canonical["revision"] + 1
         connection.execute("UPDATE knowledge_items SET status=?,revision=?,updated_at=? WHERE id=?", (status, revision, db.now(), canonical_id))
@@ -176,17 +179,12 @@ def merge_knowledge(canonical_id, duplicate_id, reason):
 
 def consolidate_history():
     from . import station
-    counts = {"sources_imported": 0, "knowledge_merged": 0, "evidence_relinked": 0, "evidence_needs_review": 0}
-    # 旧程序可能曾用摘要覆盖完整正文，优先恢复已经保存的完整原文作为当前版本。
+    counts = {"knowledge_merged": 0, "evidence_relinked": 0, "evidence_needs_review": 0}
+    # 历史摘要曾覆盖正文，优先恢复已保存的完整原文。
     for document in db.query("SELECT id,extent FROM documents WHERE extent NOT LIKE '%原文%'"):
         version = db.one("SELECT * FROM document_versions WHERE document_id=? AND extent LIKE '%原文%' ORDER BY id DESC LIMIT 1", (document["id"],))
         if version:
             db.execute("UPDATE documents SET content=?,content_hash=?,extent=? WHERE id=?", (version["content"], version["content_hash"], version["extent"], document["id"]))
-    from .providers import Source
-    for source in db.query("SELECT * FROM sources ORDER BY id"):
-        known = document_for_url(source["url"])
-        station.save_document(Source(source["title"], source["url"], source["content"], source["extent"], source["published_at"]), source["task_id"], historical=True)
-        counts["sources_imported"] += int(known is None)
     for document in db.query("SELECT id,url FROM documents ORDER BY id"):
         db.execute("INSERT OR IGNORE INTO source_aliases(url,document_id) VALUES(?,?)", (canonical_url(document["url"]), document["id"]))
     groups = {}

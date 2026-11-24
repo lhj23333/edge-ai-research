@@ -36,7 +36,7 @@ document.addEventListener("DOMContentLoaded", () => {
   };
   fetch("/map/data").then((response) => response.json()).then(({entities, relations}) => {
     if (!entities.length) {
-      showMessage("尚无关系节点。确认关注名单并完成资料采集后会显示。");
+      showMessage("尚无关系节点。深度研究保存有原文依据的关系后会显示。");
       return;
     }
     const groups = ["应用场景", "厂商", "产品", "技术路线", "软件生态"];

@@ -1,0 +1,31 @@
+[
+  {
+    "key": "hailo-blog", "name": "Hailo 官方博客", "kind": "rss", "tier": "T1",
+    "url": "https://hailo.ai/feed/", "publisher": "hailo", "owner": "Hailo",
+    "category": "厂商公告", "publisherUrlPrefixes": ["https://hailo.ai/blog/", "https://hailo.ai/company-overview/newsroom/"]
+  },
+  {
+    "key": "hailo-releases", "name": "Hailo Model Zoo Releases", "kind": "json_list", "tier": "T1",
+    "url": "https://api.github.com/repos/hailo-ai/hailo_model_zoo/releases", "publisher": "hailo", "owner": "Hailo",
+    "category": "开发者更新", "publisherUrlPrefixes": ["https://github.com/hailo-ai/hailo_model_zoo/releases/"],
+    "options": {"title": "name", "url": "html_url", "date": "published_at", "summary": "body", "exclude": ["draft", "prerelease"]}
+  },
+  {
+    "key": "sima-news", "name": "SiMa.ai 官方新闻", "kind": "web_list", "tier": "T1",
+    "url": "https://sima.ai/newsroom/", "publisher": "sima", "owner": "SiMa.ai", "category": "厂商公告",
+    "publisherUrlPrefixes": ["https://sima.ai/press-release/"],
+    "options": {"item": "main article", "url": "a[href*='/press-release/']", "title": "h2, h3", "date": "time"}
+  },
+  {
+    "key": "raspberry-pi-news", "name": "Raspberry Pi 官方新闻", "kind": "rss", "tier": "T1.5",
+    "url": "https://www.raspberrypi.com/news/feed/", "publisher": "raspberry-pi", "owner": "Raspberry Pi", "category": "设备与生态"
+  },
+  {
+    "key": "cnx-software", "name": "CNX Software", "kind": "rss", "tier": "T2",
+    "url": "https://www.cnx-software.com/feed/", "publisher": "cnx-software", "category": "垂直媒体"
+  },
+  {
+    "key": "external-local", "name": "本机脚本推送", "kind": "external", "tier": "T2",
+    "publisher": "external-local", "category": "外部提交"
+  }
+]

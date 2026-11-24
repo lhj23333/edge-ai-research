@@ -1,0 +1,19 @@
+{
+  "thresholds": {"T1": 60, "T1.5": 65, "T2": 76},
+  "category_thresholds": {"开发者更新": {"T1": 70, "T1.5": 73, "T2": 80}},
+  "event_types": ["产品发布", "软件更新", "性能披露", "商业进展", "合作伙伴", "价格变化", "融资并购", "政策标准", "其他"],
+  "browse_floor": 40,
+  "auto_research_score": 90,
+  "auto_research_types": ["产品发布", "软件更新", "性能披露"],
+  "freshness_hours": 48,
+  "backfill_months": 12,
+  "backfill_limit": 30,
+  "cluster_days": 14,
+  "cluster_top": 5,
+  "cluster_similarity": 0.62,
+  "heat_half_life_hours": 24,
+  "cadence_days": 90,
+  "stale_multiplier": 4,
+  "poll_bands": [[28, 15], [14, 30], [3, 60], [1, 120], [0, 180]],
+  "onboarding_goal": "从可核查的公开资料提议最多 6 家端侧与边缘推理独立 AI 加速器厂商和 3 个研究专题，说明关注理由并提供原文依据。"
+}

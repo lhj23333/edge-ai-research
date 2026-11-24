@@ -46,7 +46,7 @@ async def resume_research(task_id):
 
 
 async def check_saved_history(live, http, models):
-    from researcher import continuity, db, knowledge, research, station
+    from researcher import continuity, db, knowledge, research
     from researcher.providers import Gateway, ResearchError, UnknownOutcome
     from researcher.config import get_profile
     from researcher.worker import run_task
@@ -127,7 +127,7 @@ async def check_saved_history(live, http, models):
     assert failed_reads == 1 and all(isinstance(error, ResearchError) for error in failures)
     print("相同失败操作并发：只执行1次，保留错误。", flush=True)
 
-    # 直接重放已保存的真实草稿和核验结果，检查重复提交的保存行为。
+    # 使用已保存的草稿和核验结果重放提交。
     saved = db.one("SELECT s.task_id,s.inputs_json,s.outputs_json,r.outputs_json AS review_json FROM task_steps s JOIN task_steps r ON r.task_id=s.task_id AND r.stage='逐项证据核验' JOIN tasks t ON t.id=s.task_id WHERE s.stage='研究结果草稿' AND t.status='success' AND t.cancel_requested=0 ORDER BY s.task_id DESC LIMIT 1")
     assert saved, "历史数据库中没有可用于重放的真实核验结果"
     original = db.one("SELECT * FROM tasks WHERE id=?", (saved["task_id"],))
