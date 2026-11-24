@@ -1,10 +1,10 @@
 {% extends 'base.html' %}
 {% from 'macros.html' import token with context %}
-{% from 'ui.html' import icon, page_header, empty, signal %}
+{% from 'ui.html' import icon, page_header, empty %}
 {% block content %}
 {% set run_states = {'complete':'已完成','partial':'部分完成','failed':'采集失败','running':'正在采集','never':'未运行'} %}
-{% call page_header('Market watch', '行业动态', '相同公告合并为一个事件；后续版本与独立商业进展分别记录。') %}
-  <form action="/updates/scan" method="post">{{ token() }}<button class="button primary" type="submit">{{ icon('refresh') }}检查关注范围</button></form>
+{% call page_header('', '行业动态', '查看精选事件、评分达到浏览门槛的资料和近期热度。') %}
+  <form action="/updates/collect" method="post">{{ token() }}<button class="button primary" type="submit">{{ icon('refresh') }}采集启用信源</button></form>
 {% endcall %}
 
 <section class="status-strip" aria-label="采集状态">
@@ -18,19 +18,21 @@
   </div>
   <div class="status-cell">
     <span class="status-label">{{ icon('refresh') }}更新方式</span>
-    <strong class="status-value">{{ '每日自动采集' if station.auto_enabled else '手动维护中 · 自动更新待配置' }}</strong>
+    <strong class="status-value">{{ '自动轮询' if station.auto_enabled else '手动维护中 · 自动更新待配置' }}</strong>
   </div>
 </section>
 
 <form action="/updates" method="get" class="toolbar" aria-label="筛选行业动态">
+  <label>查看<select name="view">{% for key,label in [('selected','精选'),('all','全部（' ~ browse_floor ~ ' 分以上）'),('heat','热度榜')] %}<option value="{{ key }}" {{ 'selected' if filters.view==key }}>{{ label }}</option>{% endfor %}</select></label>
   <label class="toolbar-grow">关键词<span class="input-icon">{{ icon('search') }}<input type="search" name="q" value="{{ filters.q }}" placeholder="标题或事件内容"></span></label>
   <label>事件类别<select name="event_type"><option value="">全部</option>{% for value in event_types %}<option value="{{ value }}" {{ 'selected' if filters.event_type==value else '' }}>{{ value }}</option>{% endfor %}</select></label>
   <label>厂商<input name="company" value="{{ filters.company }}" placeholder="厂商名称"></label>
+  <label>专题<select name="topic_id"><option value="">全部</option>{% for topic in topics %}<option value="{{ topic.id }}" {{ 'selected' if topic.id==filters.topic_id }}>{{ topic.title }}</option>{% endfor %}</select></label>
   <label>起始日期<input type="date" name="after" value="{{ filters.after }}"></label>
   <label>结束日期<input type="date" name="before" value="{{ filters.before }}"></label>
   <div class="toolbar-actions">
     <button class="button" type="submit">{{ icon('filter') }}筛选</button>
-    {% if filters.q or filters.event_type or filters.company or filters.after or filters.before %}<a class="button ghost" href="/updates">清除</a>{% endif %}
+    {% if filters.view!='selected' or filters.topic_id or filters.q or filters.event_type or filters.company or filters.after or filters.before %}<a class="button ghost" href="/updates">清除</a>{% endif %}
   </div>
 </form>
 
@@ -45,7 +47,11 @@
           <time class="mono">{{ (event.occurred_at or event.published_at or event.created_at)[:10] }}</time>
           {% if event.background %}<span class="badge">背景资料</span>{% endif %}
           <span class="event-count">{{ icon('evidence') }}{{ event.evidence_count }} 条证据</span>
-          {{ signal(event.importance) }}
+          {% if event.get('feed_score') is not none %}
+            <span class="badge">{{ '%g'|format(event.feed_score) }} 分</span>
+            {% if event.get('independent_source_count') is not none and event.get('heat_score') is not none %}<span class="event-count">近 48 小时 {{ event.independent_source_count }} 个独立来源 · 热度 {{ '%.2f'|format(event.heat_score) }}</span>{% endif %}
+          {% endif %}
+          {% if event.get('first_party_confirmed') %}<span class="badge tone-success">T1 一手</span>{% endif %}
         </div>
         <h3><a href="/events/{{ event.id }}">{{ event.title }}</a></h3>
         <p class="event-summary">{{ event.what_happened }}</p>
@@ -53,16 +59,17 @@
         <a class="text-link" href="/events/{{ event.id }}">查看来源、影响和批注{{ icon('arrow-right') }}</a>
       </article>
       {% else %}
-      {{ empty('当前筛选下没有事件', '可以更改筛选条件，或检查关注范围。采集失败原因见右侧记录。', 'filter') }}
+      {{ empty('当前筛选下没有事件', '', 'filter') }}
       {% endfor %}
     </div>
+    {% if candidates %}<section class="panel section-space"><div class="panel-head"><h2>达到浏览门槛的其他资料</h2></div><div class="list">{% for item in candidates %}<a class="list-item" href="/documents/{{ item.document_id }}{% if item.get('version_id') is not none %}?version={{ item.version_id }}{% endif %}"><strong>{{ item.title }}</strong><small>{{ item.tier }}{% if item.get('feed_score') is not none %} · {{ item.feed_score }} 分{% endif %} · {{ item.published_at|localtime }}</small></a>{% endfor %}</div></section>{% endif %}
   </section>
 
   <aside class="stack">
     <section class="panel">
       <div class="panel-head"><h2>{{ icon('terminal') }}最近采集记录</h2></div>
       <div class="list">
-        {% for run in runs %}<a class="list-item" href="/tasks/{{ run.task_id }}"><span class="list-row"><strong class="mono">{{ run.started_at|localtime }}</strong><span class="badge dot tone-{{ run.status|tone }}">{{ run_states.get(run.status, run.status) }}</span></span><small>{{ run.details[:100] if run.details else '查看覆盖范围与资料' }}</small></a>{% else %}<p class="muted">尚无采集记录。</p>{% endfor %}
+        {% for run in runs %}<article class="list-item"><span class="list-row"><strong>{% if run.task_id %}<a href="/tasks/{{ run.task_id }}">{{ run.name }}</a>{% else %}{{ run.name }}{% endif %}</strong><span class="badge dot tone-{{ run.status|tone }}">{{ {'success':'已抓取','not_modified':'未变化','failed':'失败','running':'进行中','cancelled':'已取消','interrupted':'已中断','superseded':'配置已更新'}.get(run.status, run.status) }}</span></span><small>{{ run.started_at|localtime }} · 抓取 {{ run.fetched_count }} · 新增 {{ run.new_count }} · 闸门拦截 {{ run.gated_count }}</small>{% if run.error %}<small>{{ run.error }}</small>{% endif %}</article>{% else %}<p class="muted">尚无采集记录。</p>{% endfor %}
       </div>
     </section>
     <details class="panel" id="manual">

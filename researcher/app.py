@@ -19,12 +19,14 @@ from pydantic import ValidationError
 from sse_starlette.sse import EventSourceResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from . import __version__, db
-from .config import PRESETS, Limits, Profile, config_lock, get_profile, save_profile, settings, write_json
-from .scheduler import next_run
-from .service import KINDS, STATES, enqueue, save_artifact, usage_summary
+from . import __version__, db, research
+from .config import MODEL_STEPS, PRESETS, Limits, Profile, config_lock, describe_routes, get_profile, model_routes, save_profile, settings, write_json
+from .service import KINDS, STATES, enqueue_test, save_artifact, task_documents, usage_summary
+from .scheduler import next_topic_run, pause_topic_schedule
+from .web_ids import RecordId, parse_record_id
 
 HERE = Path(__file__).parent
+STARTED_AT = datetime.now(timezone.utc).isoformat(timespec="seconds")
 templates = Jinja2Templates(directory=str(HERE / "templates"))
 markdown = MarkdownIt("commonmark", {"html": False}).enable("table")
 
@@ -49,6 +51,18 @@ def asset_version():
         digest.update(path.relative_to(root).as_posix().encode())
         digest.update(path.read_bytes())
     return digest.hexdigest()[:12]
+
+
+def build_id():
+    digest = hashlib.sha256()
+    for path in sorted(HERE.rglob("*")):
+        if path.suffix in {".py", ".sql", ".html"} and path.is_file():
+            digest.update(path.relative_to(HERE).as_posix().encode())
+            digest.update(path.read_bytes())
+    return digest.hexdigest()[:12]
+
+
+BUILD_ID = build_id()
 
 
 TONES = {
@@ -82,6 +96,10 @@ NAVIGATION = (
     )},
     {"label": "System", "system": True, "links": (
         {"href": "/watchlist", "label": "关注与更新设置", "icon": "eye", "match": ("/watchlist",)},
+        {"href": "/admin/sources", "label": "信源管理", "icon": "link", "match": ("/admin/sources",), "children": (
+            {"href": "/admin/funnel", "label": "漏斗诊断", "match": ("/admin/funnel",)},
+            {"href": "/admin/eval", "label": "SelectBench 评测", "match": ("/admin/eval",)},
+        )},
         {"href": "/tasks", "label": "任务记录", "icon": "terminal", "match": ("/tasks",)},
         {"href": "/settings", "label": "模型与运行设置", "icon": "sliders", "match": ("/settings",)},
     )},
@@ -218,17 +236,73 @@ def create_topic(form=Depends(form_data)):
 
 
 @app.get("/topics/{topic_id}", response_class=HTMLResponse)
-def topic_detail(request: Request, topic_id: int):
+def topic_detail(request: Request, topic_id: RecordId):
     topic = required("SELECT * FROM topics WHERE id=?", (topic_id,))
     return page(request, "topic.html", title=topic["title"], topic=topic,
+        plan=db.one("SELECT * FROM topic_research_schedules WHERE topic_id=?", (topic_id,)),
+        automation=db.one("SELECT auto_enabled,watchlist_confirmed,sources_confirmed FROM station_settings WHERE id=1"),
         briefs=db.query("SELECT * FROM briefs WHERE topic_id=? ORDER BY id DESC", (topic_id,)),
         messages=db.query("SELECT m.*,t.status AS task_status,t.error AS task_error FROM messages m LEFT JOIN tasks t ON t.id=m.task_id WHERE m.topic_id=? ORDER BY m.id", (topic_id,)),
         artifacts=db.query("SELECT * FROM artifacts WHERE topic_id=? ORDER BY id DESC", (topic_id,)),
         tasks=db.query("SELECT * FROM tasks WHERE topic_id=? ORDER BY id DESC LIMIT 6", (topic_id,)))
 
 
+@app.post("/topics/{topic_id}/tasks")
+def topic_task(topic_id: RecordId, form=Depends(form_data)):
+    topic = required("SELECT * FROM topics WHERE id=?", (topic_id,))
+    try:
+        kind = form.get("kind", "research")
+        if kind not in {"research", "chat", "summary"}:
+            raise ValueError("任务类型无效")
+        brief_id = parse_record_id(form["brief_id"]) if form.get("brief_id") else None
+        if brief_id and not db.one("SELECT id FROM briefs WHERE id=? AND topic_id=?", (brief_id, topic_id)):
+            raise ValueError("简报与当前专题不匹配")
+        job = research.topic_job(topic)
+        if kind == "chat" or form.get("prompt"):
+            job["main_question"] = text(form, "prompt", 10000)
+        elif kind == "research":
+            job["main_question"] = f"定向研究《{topic['title']}》：{topic['question']}。先查阅已有原文，仅针对证据缺口补充核验。"
+        task_id = research.enqueue("revise" if kind == "summary" else "interactive", job, brief_id=brief_id)
+        return redirect(f"/tasks/{task_id}")
+    except ValueError as error:
+        return redirect(f"/topics/{topic_id}", error=str(error))
+
+
+@app.post("/topics/{topic_id}/schedule")
+def topic_schedule(topic_id: RecordId, form=Depends(form_data)):
+    destination = f"/topics/{topic_id}"
+    required("SELECT id FROM topics WHERE id=?", (topic_id,))
+    frequency = form.get("schedule")
+    action = form.get("action", "pause" if frequency == "manual" else "enable")
+    try:
+        if action == "pause":
+            with db.transaction() as connection:
+                pause_topic_schedule(connection, topic_id)
+            return redirect(destination, "专题定向更新计划已停用")
+        clock = str(form.get("schedule_time", "09:00"))
+        weekday = int(str(form.get("weekday", "0")))
+        if action not in {"save", "enable"} or frequency not in {"daily", "weekly"} or weekday not in range(7):
+            raise ValueError("请选择有效的更新频率和星期")
+        if len(clock) != 5 or datetime.strptime(clock, "%H:%M").strftime("%H:%M") != clock:
+            raise ValueError("请按 HH:MM 格式填写更新时间")
+        upcoming = next_topic_run(frequency, clock, weekday, settings()["limits"]["timezone"])
+        with db.transaction() as connection:
+            if connection.execute("SELECT research_state FROM topics WHERE id=?", (topic_id,)).fetchone()["research_state"] == "archived":
+                raise ValueError("已归档专题无法设置定向更新计划")
+            current = connection.execute("SELECT next_run FROM topic_research_schedules WHERE topic_id=?", (topic_id,)).fetchone()
+            enabled = action == "enable" or bool(current and current["next_run"])
+            connection.execute("""
+                INSERT INTO topic_research_schedules(topic_id,frequency,schedule_time,weekday,next_run) VALUES(?,?,?,?,?)
+                ON CONFLICT(topic_id) DO UPDATE SET frequency=excluded.frequency,schedule_time=excluded.schedule_time,
+                                                   weekday=excluded.weekday,next_run=excluded.next_run
+            """, (topic_id, frequency, clock, weekday, upcoming if enabled else None))
+        return redirect(destination, "专题定向更新计划已启用" if action == "enable" else "专题定向更新计划已保存")
+    except ValueError as error:
+        return redirect(destination, error=str(error))
+
+
 @app.post("/topics/{topic_id}/edit")
-def edit_topic(topic_id: int, form=Depends(form_data)):
+def edit_topic(topic_id: RecordId, form=Depends(form_data)):
     required("SELECT * FROM topics WHERE id=?", (topic_id,))
     try:
         db.execute("UPDATE topics SET title=?,question=? WHERE id=?", (text(form, "title", 160), text(form, "question", 3000), topic_id))
@@ -237,41 +311,8 @@ def edit_topic(topic_id: int, form=Depends(form_data)):
         return redirect(f"/topics/{topic_id}", error=str(error))
 
 
-@app.post("/topics/{topic_id}/schedule")
-def schedule(topic_id: int, form=Depends(form_data)):
-    required("SELECT * FROM topics WHERE id=?", (topic_id,))
-    try:
-        frequency = str(form.get("schedule"))
-        clock = str(form.get("schedule_time", "09:00"))
-        weekday = int(form.get("weekday", 0))
-        if frequency not in ("manual", "daily", "weekly") or weekday not in range(7):
-            raise ValueError("调度选项无效")
-        datetime.strptime(clock, "%H:%M")
-        if frequency != "manual":
-            raise ValueError("请在关注名单页面设置行业日报的统一更新时段")
-        upcoming = next_run(frequency, clock, weekday, settings()["limits"]["timezone"])
-        db.execute("UPDATE topics SET schedule=?,schedule_time=?,weekday=?,next_run=? WHERE id=?", (frequency, clock, weekday, upcoming, topic_id))
-        return redirect(f"/topics/{topic_id}", "自动研究规则已保存")
-    except ValueError as error:
-        return redirect(f"/topics/{topic_id}", error=str(error))
-
-
-@app.post("/topics/{topic_id}/tasks")
-def topic_task(topic_id: int, form=Depends(form_data)):
-    try:
-        kind = str(form.get("kind", "research"))
-        if kind not in ("chat", "summary"):
-            raise ValueError("任务类型无效")
-        prompt = text(form, "prompt", 10000) if kind == "chat" else ""
-        brief_id = int(form["brief_id"]) if form.get("brief_id") else None
-        task_id = enqueue(topic_id, kind, prompt, brief_id)
-        return redirect(f"/tasks/{task_id}")
-    except ValueError as error:
-        return redirect(f"/topics/{topic_id}", error=str(error))
-
-
 @app.post("/topics/{topic_id}/observations")
-def observation(topic_id: int, form=Depends(form_data)):
+def observation(topic_id: RecordId, form=Depends(form_data)):
     required("SELECT * FROM topics WHERE id=?", (topic_id,))
     try:
         body = text(form, "body", 20000)
@@ -284,15 +325,15 @@ def observation(topic_id: int, form=Depends(form_data)):
 
 
 @app.get("/briefs/{brief_id}", response_class=HTMLResponse)
-def brief_page(request: Request, brief_id: int):
+def brief_page(request: Request, brief_id: RecordId):
     brief = required("SELECT b.*,t.title AS topic_title FROM briefs b JOIN topics t ON t.id=b.topic_id WHERE b.id=?", (brief_id,))
-    return page(request, "brief.html", title=brief["title"], brief=brief, sources=db.query("SELECT * FROM sources WHERE task_id=? ORDER BY id", (brief["task_id"],)))
+    return page(request, "brief.html", title=brief["title"], brief=brief, sources=task_documents(brief["task_id"]))
 
 
 @app.post("/briefs/{brief_id}/save")
-def save_brief(brief_id: int, form=Depends(form_data)):
+def save_brief(brief_id: RecordId, form=Depends(form_data)):
     brief = required("SELECT * FROM briefs WHERE id=?", (brief_id,))
-    sources = db.query("SELECT * FROM sources WHERE task_id=? ORDER BY id", (brief["task_id"],))
+    sources = task_documents(brief["task_id"])
     appendix = "\n\n## 来源记录\n" + "\n".join(f"- [{source['title']}]({source['url']})；发布日期：{source['published_at'] or '未提供'}；获取时间：{source['fetched_at']}；{source['extent']}" for source in sources)
     artifact_id = save_artifact(brief["topic_id"], brief["title"], brief["body"] + appendix, brief["task_id"])
     return redirect(f"/artifacts/{artifact_id}", "已保存为新的成果版本")
@@ -306,13 +347,13 @@ def library(request: Request, q: str = ""):
 
 
 @app.get("/artifacts/{artifact_id}", response_class=HTMLResponse)
-def artifact_page(request: Request, artifact_id: int):
+def artifact_page(request: Request, artifact_id: RecordId):
     artifact = required("SELECT a.*,t.title AS topic_title FROM artifacts a JOIN topics t ON t.id=a.topic_id WHERE a.id=?", (artifact_id,))
     return page(request, "artifact.html", title=artifact["title"], artifact=artifact, versions=db.query("SELECT id,title,version,created_at FROM artifacts WHERE topic_id=? ORDER BY id DESC", (artifact["topic_id"],)))
 
 
 @app.post("/artifacts/{artifact_id}")
-def edit_artifact(artifact_id: int, form=Depends(form_data)):
+def edit_artifact(artifact_id: RecordId, form=Depends(form_data)):
     artifact = required("SELECT * FROM artifacts WHERE id=?", (artifact_id,))
     try:
         new_id = save_artifact(artifact["topic_id"], text(form, "title", 180), text(form, "body", 100000), artifact["origin_task"])
@@ -322,7 +363,7 @@ def edit_artifact(artifact_id: int, form=Depends(form_data)):
 
 
 @app.get("/artifacts/{artifact_id}/export")
-def export_artifact(artifact_id: int):
+def export_artifact(artifact_id: RecordId):
     artifact = required("SELECT * FROM artifacts WHERE id=?", (artifact_id,))
     body = f"# {artifact['title']}\n\n版本：{artifact['version']}\n保存时间：{artifact['created_at']}\n\n{artifact['body']}\n"
     return PlainTextResponse(body, headers={"Content-Disposition": f'attachment; filename="research-{artifact_id}-v{artifact["version"]}.md"'}, media_type="text/markdown")
@@ -335,20 +376,20 @@ def task_list(request: Request):
 
 
 @app.get("/tasks/{task_id}", response_class=HTMLResponse)
-def task_page(request: Request, task_id: int):
+def task_page(request: Request, task_id: RecordId):
     task = required("SELECT x.*,t.title AS topic_title FROM tasks x LEFT JOIN topics t ON t.id=x.topic_id WHERE x.id=?", (task_id,))
     return page(request, "task.html", title=KINDS.get(task["kind"], "研究任务"), task=task,
-        sources=db.query("SELECT * FROM sources WHERE task_id=? ORDER BY id", (task_id,)),
         brief=db.one("SELECT id FROM briefs WHERE task_id=?", (task_id,)),
         artifact=db.one("SELECT id FROM artifacts WHERE origin_task=? ORDER BY id DESC LIMIT 1", (task_id,)),
         calls=db.query("SELECT * FROM usage WHERE task_id=? ORDER BY id", (task_id,)),
         steps=db.query("SELECT * FROM task_steps WHERE task_id=? ORDER BY id", (task_id,)),
         coverage=db.query("SELECT c.* FROM coverage_checks c JOIN collection_runs r ON r.id=c.run_id WHERE r.task_id=? ORDER BY c.id", (task_id,)),
-        documents=db.query("SELECT d.* FROM documents d JOIN document_task_links l ON l.document_id=d.id WHERE l.task_id=? ORDER BY d.id", (task_id,)))
+        feed_runs=db.query("SELECT r.*,s.name FROM feed_runs r JOIN feed_sources s ON s.id=r.source_id WHERE r.task_id=? ORDER BY r.id", (task_id,)),
+        documents=task_documents(task_id))
 
 
 @app.get("/tasks/{task_id}/events")
-async def task_events(request: Request, task_id: int):
+async def task_events(request: Request, task_id: RecordId):
     required("SELECT id FROM tasks WHERE id=?", (task_id,))
 
     async def stream():
@@ -369,7 +410,7 @@ async def task_events(request: Request, task_id: int):
 
 
 @app.post("/tasks/{task_id}/cancel")
-def cancel_task(task_id: int, form=Depends(form_data)):
+def cancel_task(task_id: RecordId, form=Depends(form_data)):
     task = required("SELECT * FROM tasks WHERE id=?", (task_id,))
     with db.transaction() as connection:
         connection.execute("UPDATE tasks SET cancel_requested=1 WHERE id=? AND status IN ('queued','running')", (task_id,))
@@ -384,14 +425,15 @@ def cancel_task(task_id: int, form=Depends(form_data)):
 
 @app.get("/settings", response_class=HTMLResponse)
 def settings_page(request: Request):
-    return page(request, "settings.html", title="模型与运行设置", usage=usage_summary())
+    return page(request, "settings.html", title="模型与运行设置", usage=usage_summary(),
+                routes=list(describe_routes(settings())), route_usage={row["route"]: row for row in usage_summary(by_route=True)})
 
 
 @app.post("/settings/profiles")
 def profile_save(form=Depends(form_data)):
     try:
         profile_id = str(form.get("id") or secrets.token_hex(8))
-        profile = Profile(id=profile_id, name=text(form, "name", 80), provider=text(form, "provider", 30), base_url=text(form, "base_url", 500), model=text(form, "model", 120), reasoning_effort=str(form.get("reasoning_effort", "low")), input_price=float(form["input_price"]) if form.get("input_price") else None, output_price=float(form["output_price"]) if form.get("output_price") else None, price_note=str(form.get("price_note", "")))
+        profile = Profile(id=profile_id, name=text(form, "name", 80), provider=text(form, "provider", 30), base_url=text(form, "base_url", 500), model=text(form, "model", 120), reasoning_effort=str(form.get("reasoning_effort", "low")), input_price=float(form["input_price"]) if form.get("input_price") else None, output_price=float(form["output_price"]) if form.get("output_price") else None, price_note=str(form.get("price_note", "")), search_price=float(form["search_price"]) if form.get("search_price") else None)
         key = str(form.get("api_key", "")).strip()
         if len(key) > 2000 or "\n" in key or "\r" in key:
             raise ValueError("API 密钥格式无效")
@@ -422,7 +464,7 @@ def test_profile(form=Depends(form_data)):
         mode = str(form.get("mode"))
         if mode not in ("test_chat", "test_search", "test_tools"):
             raise ValueError("测试类型无效")
-        task_id = enqueue(None, mode, profile_id=str(form.get("profile_id")))
+        task_id = enqueue_test(mode, str(form.get("profile_id")))
         return redirect(f"/tasks/{task_id}")
     except ValueError as error:
         return redirect("/settings", error=str(error))
@@ -431,20 +473,46 @@ def test_profile(form=Depends(form_data)):
 @app.post("/settings/limits")
 def limits_save(form=Depends(form_data)):
     try:
-        limits = Limits(daily_requests=form.get("daily_requests"), task_requests=form.get("task_requests"), output_tokens=form.get("output_tokens"), timezone="Asia/Shanghai")
         with config_lock():
             config = settings()
-            config["limits"] = limits.model_dump()
+            values = {key: form.get(key, config["limits"][key]) for key in ("daily_requests", "task_requests", "output_tokens", "timezone")}
+            values.update({key: form.get(key) or None if key in form else config["limits"][key] for key in ("minute_cost", "hour_cost", "daily_cost")})
+            config["limits"] = Limits(**values).model_dump()
             write_json("config.json", config)
         return redirect("/settings", "调用额度已保存，后续任务使用新设置")
-    except ValidationError:
+    except ValidationError as error:
+        if any(issue["loc"] == ("timezone",) for issue in error.errors(include_input=False)):
+            return redirect("/settings", error="时区无效，请填写有效的 IANA 时区名称")
         return redirect("/settings", error="额度格式无效，请填写页面允许范围内的整数")
+
+
+@app.post("/settings/routes")
+def save_routes(form=Depends(form_data)):
+    try:
+        with config_lock():
+            config = settings()
+            entries = {}
+            for step in MODEL_STEPS:
+                fields = {key: form.get(f"{step}_{key}") or None for key in ("profile_id", "reasoning_effort", "output_tokens")}
+                if fields["profile_id"]:
+                    get_profile(fields["profile_id"], config)
+                entries[step] = fields
+            config["model_routes"] = model_routes(entries)
+            write_json("config.json", config)
+        return redirect("/settings#routes", "模型步骤路由已保存")
+    except ValidationError:
+        return redirect("/settings#routes", error="请检查步骤的模型、思考强度与输出上限")
+    except ValueError as error:
+        return redirect("/settings#routes", error=str(error))
 
 
 @app.get("/health")
 def health():
-    db.one("SELECT 1 AS ok")
-    return {"status": "ok", "version": __version__, "worker": "running" if worker_alive() else "stopped"}
+    return {
+        "status": "ok", "version": __version__, "build_id": BUILD_ID, "started_at": STARTED_AT,
+        "schema_version": db.one("PRAGMA user_version")["user_version"],
+        "worker": "running" if worker_alive() else "stopped",
+    }
 
 
 from .station_web import register
@@ -454,3 +522,7 @@ register(app, page, form_data, redirect, required, text)
 from .research_web import register as register_research
 
 register_research(app, page, form_data, redirect, required, text)
+
+from .ingest.web import register as register_ingest
+
+register_ingest(app, page, form_data, redirect, required, text)

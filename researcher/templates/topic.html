@@ -1,5 +1,6 @@
 {% extends 'base.html' %}
 {% from 'station_macros.html' import annotation_form with context %}
+{% from 'macros.html' import token with context %}
 {% from 'ui.html' import icon %}
 {% block content %}
 {% set roles = {'user':'历史提问','assistant':'历史回答','observation':'个人观察'} %}
@@ -41,8 +42,37 @@
     </section>
     <section class="panel">
       <div class="panel-head"><h2>{{ icon('target') }}继续研究</h2></div>
-      <a class="button full" href="/questions?target_kind=topic&target_id={{ topic.id }}">{{ icon('search') }}提出具体问题</a>
-      <p class="field-help section-space">新研究会明确对象、用途、条件和证据要求。个人批注需要在问题表单中主动选择。</p>
+      <form action="/topics/{{ topic.id }}/tasks" method="post" class="stack-form">
+        {{ token() }}
+        <label>研究问题（可选）<textarea name="prompt" rows="3" maxlength="10000" placeholder="留空时沿用本专题的问题"></textarea></label>
+        <button class="button primary" type="submit">{{ icon('search') }}发起专题深度研究</button>
+      </form>
+      <p class="field-help section-space"><a href="/questions?target_kind=topic&target_id={{ topic.id }}">填写定向问题</a>，可补充用途和条件，或选择本次使用的个人批注。</p>
+    </section>
+    <section class="panel">
+      <div class="panel-head"><h2>{{ icon('clock') }}专题定向更新计划</h2></div>
+      <p class="field-help">历史定时计划已停用。定向更新使用已归档的本地原文修订本专题判断。</p>
+      {% if topic.schedule in ['daily', 'weekly'] %}<p class="field-help">历史设置为{{ '每日' if topic.schedule == 'daily' else '每周' }} {{ topic.schedule_time }}。</p>{% endif %}
+      {% if plan and plan.next_run and topic.research_state != 'archived' %}
+        {% if automation.auto_enabled and automation.watchlist_confirmed and automation.sources_confirmed %}
+          <p>已启用 · 下次计划时间 {{ plan.next_run|localtime }}</p>
+        {% else %}<p>已启用 · 等待开启自动更新并确认关注范围与信源。<a href="/watchlist">查看关注设置</a></p>{% endif %}
+      {% else %}<p>{{ '定向更新计划已停用' if plan else '定向更新计划尚未启用' }}</p>{% endif %}
+      {% if topic.research_state != 'archived' %}
+      {% set weekdays = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'] %}
+      {% set weekday = plan.weekday if plan else topic.weekday %}
+      <form action="/topics/{{ topic.id }}/schedule" method="post" class="stack-form">
+        {{ token() }}
+        <label>频率<select name="schedule"><option value="daily">每日</option><option value="weekly" {{ 'selected' if (plan.frequency if plan else topic.schedule) == 'weekly' else '' }}>每周</option></select></label>
+        <label>时间<input type="time" name="schedule_time" value="{{ plan.schedule_time if plan else topic.schedule_time }}" required></label>
+        <label>每周执行日<select name="weekday">{% for day in weekdays %}<option value="{{ loop.index0 }}" {{ 'selected' if loop.index0 == weekday else '' }}>{{ day }}</option>{% endfor %}</select></label>
+        <div class="form-actions">
+          <button class="button" type="submit" name="action" value="save">保存计划</button>
+          {% if plan and plan.next_run %}<button class="button" type="submit" name="action" value="pause" formnovalidate>停用计划</button>
+          {% else %}<button class="button primary" type="submit" name="action" value="enable">启用计划</button>{% endif %}
+        </div>
+      </form>
+      {% endif %}
     </section>
   </aside>
 </div>

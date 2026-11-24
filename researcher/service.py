@@ -1,62 +1,24 @@
-import sqlite3
-
 from . import db
 from .config import fingerprint, get_profile, settings
 
 STATES = {"queued": "排队中", "running": "正在研究", "success": "已完成", "failed": "执行失败", "cancelled": "已取消", "interrupted": "已中断"}
-KINDS = {"research": "历史联网研究", "chat": "历史讨论", "summary": "整理成果", "test_chat": "连接测试", "test_search": "联网测试", "onboard": "提出关注名单", "scan": "行业采集与认知更新", "question": "定向研究", "revise": "根据已有证据修订专题", "interactive": "探索研究", "followup": "后续问题研究"}
+KINDS = {"research": "历史联网研究", "chat": "历史讨论", "summary": "整理成果", "test_chat": "连接测试", "test_search": "联网测试", "onboard": "提出关注名单", "scan": "历史行业检查", "feed": "受控信源采集", "event_research": "事件深度核验", "selectbench": "SelectBench 评测", "question": "定向研究", "revise": "根据已有证据修订专题", "interactive": "探索研究", "followup": "后续问题研究"}
 KINDS["test_tools"] = "研究工具调用测试"
 
 
-def enqueue(topic_id, kind, prompt="", brief_id=None, profile_id=None, schedule_key=None):
-    if topic_id and kind in {"chat", "summary", "research"}:
-        from .research import enqueue as enqueue_research
-        topic = db.one("SELECT title,question FROM topics WHERE id=?", (topic_id,))
-        if not topic:
-            raise ValueError("研究主题不存在")
-        goal = prompt if kind == "chat" else f"检查专题“{topic['title']}”的变化及尚未解决的问题：{topic['question']}。复用已有资料，只调查缺少的依据和需要检查的变化。" if kind == "research" else None
-        return enqueue_research("revise" if kind == "summary" else "interactive", {"target_kind": "topic", "target_id": topic_id, "topic_id": topic_id, **({"main_question": goal} if goal else {})}, schedule_key, automatic=bool(schedule_key), profile_id=profile_id)
+def enqueue_test(kind, profile_id):
     profile = get_profile(profile_id)
-    if kind in ("research", "test_search") and profile.provider == "compatible":
-        raise ValueError("该配置仅支持已有资料讨论，请选择其他服务商执行联网研究")
-    if kind == "research" and not profile.search_verified:
-        raise ValueError("请在设置中先完成该模型的联网测试")
-    if kind in ("chat", "summary") and not profile.chat_verified:
-        raise ValueError("请在设置中先完成该模型的连接测试")
-    if topic_id and not db.one("SELECT id FROM topics WHERE id=?", (topic_id,)):
-        raise ValueError("研究主题不存在")
-    if brief_id and not db.one("SELECT id FROM briefs WHERE id=? AND topic_id=?", (brief_id, topic_id)):
-        raise ValueError("简报与当前主题不匹配")
-    try:
-        with db.transaction() as connection:
-            cursor = connection.execute("INSERT INTO tasks(topic_id,kind,prompt,profile_id,profile_fingerprint,provider,model,created_at,context_brief,schedule_key) VALUES(?,?,?,?,?,?,?,?,?,?)", (topic_id, kind, prompt, profile.id, fingerprint(profile), profile.provider, profile.model, db.now(), brief_id, schedule_key))
-            task_id = cursor.lastrowid
-            if kind == "chat":
-                connection.execute("INSERT INTO messages(topic_id,task_id,brief_id,role,body,created_at) VALUES(?,?,?,?,?,?)", (topic_id, task_id, brief_id, "user", prompt, db.now()))
-            return task_id
-    except sqlite3.IntegrityError:
-        if schedule_key:
-            existing = db.one("SELECT id FROM tasks WHERE schedule_key=?", (schedule_key,))
-            if existing:
-                return existing["id"]
-        raise ValueError("该主题已有排队或执行中的任务，请等待完成或取消任务") from None
+    if kind == "test_search" and profile.provider == "compatible":
+        raise ValueError("该配置未提供独立联网搜索")
+    return db.execute("INSERT INTO tasks(kind,profile_id,profile_fingerprint,provider,model,created_at,priority) VALUES(?,?,?,?,?,?,10)",
+                      (kind, profile.id, fingerprint(profile), profile.provider, profile.model, db.now()))
 
 
-def context(topic_id, brief_id=None):
-    sections = []
-    if brief_id:
-        brief = db.one("SELECT * FROM briefs WHERE id=? AND topic_id=?", (brief_id, topic_id))
-        if brief:
-            sections.append(f"当前阅读的简报（{brief['created_at']}）：\n{brief['body'][:12000]}")
-    for artifact in db.query("SELECT * FROM artifacts WHERE topic_id=? ORDER BY id DESC LIMIT 3", (topic_id,)):
-        sections.append(f"已有研究成果，版本 {artifact['version']}（{artifact['created_at']}）：\n{artifact['body'][:8000]}")
-    for brief in db.query("SELECT * FROM briefs WHERE topic_id=? ORDER BY id DESC LIMIT 2", (topic_id,)):
-        if brief["id"] != brief_id:
-            sections.append(f"此前简报（{brief['created_at']}）：\n{brief['body'][:7000]}")
-    messages = db.query("SELECT m.* FROM messages m JOIN tasks t ON t.id=m.task_id WHERE m.topic_id=? AND m.role IN ('user','assistant') AND t.status='success' ORDER BY m.id DESC LIMIT 12", (topic_id,))
-    for message in reversed(messages):
-        sections.append(f"{message['role']}（{message['created_at']}）：{message['body'][:3000]}")
-    return "\n\n".join(sections)[:52000]
+def task_documents(task_id):
+    return db.query("SELECT d.id,d.title,d.url,d.publisher,d.published_at,v.id AS version_id,v.extent,v.fetched_at,v.fetched_at AS last_fetched_at FROM document_task_links l JOIN documents d ON d.id=l.document_id "
+                    "JOIN document_versions v ON v.id=coalesce(l.recorded_version_id,(SELECT id FROM document_versions WHERE document_id=d.id "
+                    "ORDER BY CASE WHEN extent LIKE '%原文%' THEN 0 ELSE 1 END,id DESC LIMIT 1)) "
+                    "WHERE l.task_id=? ORDER BY d.id", (task_id,))
 
 
 def save_artifact(topic_id, title, body, origin_task=None):
@@ -68,8 +30,11 @@ def save_artifact(topic_id, title, body, origin_task=None):
         return cursor.lastrowid
 
 
-def usage_summary():
+def usage_summary(by_route=False):
     from datetime import datetime
     from zoneinfo import ZoneInfo
     day = datetime.now(ZoneInfo(settings()["limits"]["timezone"])).date().isoformat()
-    return db.one("SELECT count(*) AS requests,coalesce(sum(input_tokens),0) AS input_tokens,coalesce(sum(output_tokens),0) AS output_tokens,sum(estimate) AS estimate,sum(CASE WHEN input_tokens IS NULL AND output_tokens IS NULL THEN 1 ELSE 0 END) AS unknown FROM usage WHERE day=?", (day,))
+    aggregates = "count(*) AS requests,coalesce(sum(input_tokens),0) AS input_tokens,coalesce(sum(output_tokens),0) AS output_tokens,sum(estimate) AS estimate,sum(CASE WHEN input_tokens IS NULL AND output_tokens IS NULL THEN 1 ELSE 0 END) AS unknown"
+    if by_route:
+        return db.query("SELECT route," + aggregates + " FROM usage WHERE day=? GROUP BY route ORDER BY route", (day,))
+    return db.one("SELECT " + aggregates + " FROM usage WHERE day=?", (day,))

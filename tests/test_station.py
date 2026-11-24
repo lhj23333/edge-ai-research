@@ -1,10 +1,11 @@
 import pytest
+from lxml import html
 from pydantic import ValidationError
 
 from researcher import db, station
-from researcher.pipeline import Extraction, TopicAssessment, store_extraction
+from researcher.research_engine import save_research_event
+from researcher.research_models import Draft, ExtractEvent
 from researcher.providers import ResearchError, Source
-from researcher.service import context
 
 
 def test_event_sources_aggregate_and_distinct_milestones(topic):
@@ -33,7 +34,7 @@ def test_event_sources_aggregate_and_distinct_milestones(topic):
     assert repeated == first and not created
     assert db.one("SELECT count(*) AS n FROM event_claims WHERE event_id=?", (first,))["n"] == 2
     renamed = dict(release_event, identity_key="Hailo|Hailo-10H|产品上市|2025-07-23", title="Hailo-10H 产品上市")
-    renamed_id, created = station.add_event(renamed, [claim_a], [company_id, product_id], [topic["id"]])
+    renamed_id, created = station.add_event(renamed, [claim_a], [company_id, product_id], [topic["id"]], existing_event_id=first)
     assert renamed_id == first and not created
     assert db.one("SELECT event_id FROM event_aliases WHERE identity_key=?", (station.normalized(renamed["identity_key"]),))["event_id"] == first
     commercial_event = dict(release_event, identity_key="Hailo|Hailo-10H|商用|2025", title="Hailo-10H 商用", event_type="商业进展")
@@ -62,10 +63,41 @@ def test_claim_excerpt_and_judgment_history(client, csrf, topic):
     assert db.one("SELECT count(*) AS n FROM judgment_versions")["n"] == 3
 
 
+def test_manual_update_binds_claim_to_saved_excerpt_and_preserves_legacy_claim(client, csrf):
+    url = "https://www.raspberrypi.com/news/citizen-science-with-raspberry-pi/"
+    title = "Citizen science with Raspberry Pi"
+    excerpt = "This Maker Monday, we look at ways environmentalists are using Raspberry Pi to understand the world around them."
+    document, old_version = station.save_document(Source(title, url, excerpt, "用户提供摘录"), None)
+    legacy = station.save_claim(document, old_version, "Raspberry Pi 展示环境监测项目。", excerpt, "待核实")
+    form = {"csrf": csrf, "title": title, "what_happened": "Raspberry Pi 介绍环境监测中的应用。", "why_important": "记录公开的边缘设备应用。",
+            "company": "Raspberry Pi", "event_type": "其他", "url": url, "excerpt": excerpt}
+    response = client.post("/updates/manual", data=form, follow_redirects=False)
+    assert response.status_code == 303 and response.headers["location"].startswith("/events/")
+    claim = db.one("SELECT id,document_version_id,label FROM claims WHERE statement=?", (form["what_happened"],))
+    assert claim["document_version_id"] == old_version and claim["label"] == "待核实"
+    evidence, = db.query("SELECT ch.id,ch.version_id,ch.content,ch.start_offset,ch.end_offset,ce.verdict FROM claim_evidence ce "
+                         "JOIN document_chunks ch ON ch.id=ce.chunk_id JOIN document_versions v ON v.id=ch.version_id "
+                         "WHERE ce.claim_id=? AND v.document_id=?", (claim["id"], document))
+    assert evidence == {"id": evidence["id"], "version_id": old_version, "content": excerpt,
+                        "start_offset": 0, "end_offset": len(excerpt), "verdict": "insufficient"}
+    assert not db.query("SELECT chunk_id FROM claim_evidence WHERE claim_id=?", (legacy,))
+    assert db.one("SELECT document_version_id FROM claims WHERE id=?", (legacy,))["document_version_id"] == old_version
+    event = client.get(response.headers["location"])
+    path = f"/documents/{document}?version={old_version}"
+    link = f"{path}#chunk-{evidence['id']}"
+    assert link in html.fromstring(event.content).xpath("//a/@href")
+    source = client.get(path)
+    assert source.status_code == 200 and "仅记录资料版本，暂无原文片段关联" in source.text
+    assert html.fromstring(source.content).xpath(f"//*[@id='chunk-{evidence['id']}']")
+    response = client.post("/updates/manual", data=form, follow_redirects=False)
+    assert response.status_code == 303
+    assert db.query("SELECT chunk_id FROM claim_evidence WHERE claim_id=?", (claim["id"],)) == [{"chunk_id": evidence["id"]}]
+
+
 def test_personal_annotation_is_separate_and_comparison_needs_conditions(client, csrf, topic):
     body = "希望核查软件迁移如何影响产品竞争力。"
     client.post("/annotations", data={"csrf": csrf, "target_kind": "topic", "target_id": topic["id"], "body": body})
-    assert body not in context(topic["id"])
+    assert not db.query("SELECT id FROM claims WHERE statement=?", (body,))
     assert db.one("SELECT body FROM annotations WHERE target_kind='topic' AND target_id=?", (topic["id"],))["body"] == body
     first = station.entity("产品", "Hailo-8")
     second = station.entity("产品", "Hailo-10H")
@@ -91,7 +123,7 @@ def test_deployment_question_waits_for_scenario_and_note_has_versions(client, cs
     edited = body + "关注功耗条件。"
     client.post(f"/annotations/{note['id']}", data={"csrf": csrf, "body": edited})
     assert db.one("SELECT count(*) AS n FROM annotation_versions WHERE annotation_id=?", (note["id"],))["n"] == 2
-    assert body not in context(topic["id"])
+    assert not db.query("SELECT id FROM claims WHERE statement=?", (body,))
 
 
 def test_comparison_rejects_more_than_three_products(client):
@@ -102,28 +134,52 @@ def test_comparison_rejects_more_than_three_products(client):
     assert "一次最多选择三款产品" in response.text
 
 
-def test_numeric_model_reference_is_normalized():
-    item = Extraction.model_validate({"claims": [{"ref": 1, "passage_id": "d17v1p0", "statement": "Hailo 公司资料宣称超 300 个客户项目", "label": "厂商宣称"}], "events": [], "fields": [], "relations": [], "questions": []})
-    assert item.claims[0].ref == "1"
+def test_comparison_excludes_non_products_archived_and_missing_ids(client):
+    manufacturer = station.entity("厂商", "Hailo")
+    first = station.entity("产品", "Hailo-8")
+    second = station.entity("产品", "Hailo-10H")
+    archived = station.entity("产品", "Hailo-8R")
+    db.execute("UPDATE entities SET state='archived' WHERE id=?", (archived,))
+    response = client.get("/compare", params=[("id", identifier) for identifier in (manufacturer, first, second, archived, 999999, second)])
+    assert response.status_code == 200
+    assert [row["id"] for row in response.context["selected"]] == [second, first]
+    assert "2 款产品" in response.text
+    assert "一次最多选择三款产品" not in response.text
+
+
+@pytest.mark.parametrize(("first", "second", "comparable"), [
+    ("典型", "典型", False),
+    ("模型 ResNet-50；INT8；批量 1；设备 Raspberry Pi 5", "模型 ResNet-50；INT8；批量 1；设备 Raspberry Pi 5", False),
+    ("模型 ResNet-50；INT8；批量 1；功耗 5W；设备 Raspberry Pi 5", "模型 ResNet-50；INT8；批量 2；功耗 5W；设备 Raspberry Pi 5", False),
+    ("模型 ResNet-50；INT8；批量 1；功耗 5W；设备 Raspberry Pi 5", "模型 ResNet-50；INT8；批量 1；功耗 5W；设备 Raspberry Pi 5", True),
+])
+def test_comparison_requires_complete_and_matching_dimensions(client, first, second, comparable):
+    products = [station.entity("产品", name) for name in ("Hailo-8", "Hailo-10H")]
+    for identifier, value in zip(products, (first, second)):
+        db.execute("INSERT INTO entity_fields(entity_id,field_name,value,updated_at) VALUES(?,'测试条件',?,?)",
+                   (identifier, value, db.now()))
+    response = client.get("/compare", params=[("id", identifier) for identifier in products])
+    assert response.context["comparable"] is comparable
+    assert ("暂不能直接排名" in response.text) is not comparable
 
 
 def test_topic_update_requires_one_judgment_per_purpose():
-    revision = {"topic_id": 2, "purpose": "行业竞争", "conclusion": "Hailo 的软件套件提供模型编译和运行时等组件。", "status": "得到加强", "reason": "本次补充软件工具链相关的公开资料。", "event_id": 3, "supporting_claim_ids": [1]}
+    revision = {"topic_id": 2, "purpose": "行业竞争", "conclusion": "Hailo 的软件套件提供模型编译和运行时等组件。", "status": "得到加强", "reason": "本次补充软件工具链相关的公开资料。", "supporting_refs": ["f1"]}
     with pytest.raises(ValidationError):
-        TopicAssessment.model_validate({"industry": [revision, revision], "deployment": None, "questions": []})
+        Draft.model_validate({"judgments": [revision, revision], "completion_notes": "已检查软件条件和适用范围。", "complete": True})
 
 
 def test_event_date_must_be_supported_by_cited_source(topic):
     text = "时间：2026-10-29 13:16\n贸泽电子即日起开售NXP Semiconductors的全新Ara240独立神经处理单元。"
     source = Source("贸泽开售 NXP Ara240", "https://www.eepw.com.cn/article/202610/484309.htm", text, "网页内容（服务商提取）", "2026-10-28T16:00:00+00:00")
     document_id, version_id = station.save_document(source, None)
-    found = {source.url: (document_id, version_id)}
-    passages = {"ara240-date": {"document_id": document_id, "text": text}}
-    value = {"claims": [{"ref": "c1", "passage_id": "ara240-date", "statement": "贸泽电子开售 NXP Ara240 独立神经处理单元。", "label": "厂商宣称"}], "events": [{"identity_key": "nxp|ara240|产品发布|2026-10-29", "event_type": "产品发布", "title": "NXP Ara240 独立神经处理单元上市", "what_happened": "贸泽电子宣布开售 Ara240 独立神经处理单元。", "why_important": "公开销售渠道为边缘推理部署提供了新的候选产品。", "occurred_at": "2026-10-28", "claim_refs": ["c1"], "entities": [{"kind": "产品", "name": "Ara240"}], "topic_ids": [topic["id"]]}], "questions": []}
+    claim_id = station.save_claim(document_id, version_id, "贸泽电子开售 NXP Ara240 独立神经处理单元。", text, "厂商宣称")
+    scope = {"entities": [], "topics": [topic]}
+    value = {"identity_key": "nxp|ara240|产品发布|2026-10-29", "event_type": "产品发布", "title": "NXP Ara240 独立神经处理单元上市", "what_happened": "贸泽电子宣布开售 Ara240 独立神经处理单元。", "why_important": "公开销售渠道为边缘推理部署提供了新的候选产品。", "occurred_at": "2026-10-28", "claim_refs": [1], "entities": [{"kind": "产品", "name": "Ara240"}], "topic_ids": [topic["id"]]}
     with pytest.raises(ResearchError, match="发生日期缺少"):
-        store_extraction(Extraction.model_validate(value), found, {"entities": [], "topics": [topic]}, passages)
-    assert not db.query("SELECT * FROM claims")
-    value["events"][0]["occurred_at"] = "2026-10-29"
-    event_ids, new_ids, claim_ids = store_extraction(Extraction.model_validate(value), found, {"entities": [], "topics": [topic]}, passages)
-    assert len(event_ids) == len(new_ids) == len(claim_ids) == 1
-    assert db.one("SELECT occurred_at FROM events WHERE id=?", (event_ids[0],))["occurred_at"] == "2026-10-29"
+        save_research_event(ExtractEvent.model_validate(value), [{"content": text}], [claim_id], scope)
+    assert not db.query("SELECT * FROM events")
+    value["occurred_at"] = "2026-10-29"
+    event_id, created = save_research_event(ExtractEvent.model_validate(value), [{"content": text}], [claim_id], scope)
+    assert created
+    assert db.one("SELECT occurred_at FROM events WHERE id=?", (event_id,))["occurred_at"] == "2026-10-29"

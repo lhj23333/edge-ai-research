@@ -94,7 +94,7 @@
         </div>
         <div class="command-section" data-command-section="scopes" hidden>
           <p class="command-group">检索范围</p>
-          {% for href, label, symbol in [('/updates', '行业动态', 'pulse'), ('/companies', '厂商与产品', 'chip'), ('/evidence', '证据管理', 'evidence'), ('/library', '成果库', 'archive'), ('/personal', '个人批注', 'note')] %}
+          {% for href, label, symbol in [('/updates', '行业动态', 'pulse'), ('/companies', '厂商与产品', 'chip'), ('/evidence', '证据管理', 'evidence'), ('/library', '成果库', 'archive'), ('/personal', '个人批注', 'note'), ('/admin/funnel', '漏斗条目', 'filter')] %}
           <a class="command-item" href="{{ href }}" data-command-search="{{ href }}" hidden>{{ icon(symbol) }}<span>在{{ label }}中查找“<b data-command-term></b>”</span><small>{{ href }}</small></a>
           {% endfor %}
         </div>

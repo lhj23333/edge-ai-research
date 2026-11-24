@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from researcher import db, knowledge, research, station
 from researcher.app import app
 from researcher.config import DATA
+from researcher.ingest.jobs import enqueue as enqueue_feed
 from researcher.research_engine import ResearchRun
 from researcher.worker import run_task
 
@@ -86,12 +87,13 @@ async def main(stage):
                         break
                     await asyncio.sleep(.1)
                 before = db.one("SELECT count(*) AS n FROM usage WHERE task_id=? AND operation='plan' AND status='success'", (task["id"],))["n"]
-                saved_operation = db.one("SELECT outputs_json FROM research_operations WHERE task_id=? AND operation_key='planner:0' AND status='success'", (task["id"],))
+                saved_operation = db.one("SELECT operation_key,outputs_json FROM research_operations WHERE task_id=? AND kind='plan' AND status='success' ORDER BY id LIMIT 1", (task["id"],))
+                assert saved_operation and before > 0
                 research.retry(task["id"])
                 await execute(task["id"])
                 after = db.one("SELECT count(*) AS n FROM research_operations WHERE task_id=? AND kind='plan' AND status='success'", (task["id"],))["n"]
                 assert after >= before
-                assert db.one("SELECT outputs_json FROM research_operations WHERE task_id=? AND operation_key='planner:0'", (task["id"],)) == saved_operation
+                assert db.one("SELECT operation_key,outputs_json FROM research_operations WHERE task_id=? AND operation_key=?", (task["id"], saved_operation["operation_key"])) == saved_operation
             else:
                 completed, result = await execute(task["id"])
                 assert result["points"], completed["result_text"]
@@ -107,10 +109,11 @@ async def main(stage):
                     assert db.one("SELECT count(*) AS n FROM usage WHERE task_id=?", (repeated,))["n"] == 0
                 else:
                     raise RuntimeError("真实规格资料问题尚未完整回答：" + completed["result_text"])
-        if stage in {"scan", "all"}:
-            task_id = research.enqueue("scan")
+        if stage in {"collect", "all"}:
+            task_id = enqueue_feed()
             _, result = await execute(task_id)
-            assert db.one("SELECT id FROM daily_issues WHERE run_id IN (SELECT id FROM collection_runs WHERE task_id=?)", (task_id,))
+            assert db.query("SELECT id FROM feed_runs WHERE task_id=?", (task_id,))
+            assert not db.query("SELECT id FROM usage WHERE task_id=? AND operation='search'", (task_id,))
             assert client.get("/").status_code == 200
         if stage in {"revise", "all"}:
             topic = db.one("SELECT * FROM topics WHERE research_state='active' ORDER BY id LIMIT 1")
@@ -131,6 +134,6 @@ async def main(stage):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="使用真实资料和当前配置验证 AI 研究能力，research/scan/revise/resume 会调用 API")
-    parser.add_argument("--stage", choices=["retrieval", "research", "scan", "revise", "resume", "reuse", "cancel", "all"], default="retrieval")
+    parser = argparse.ArgumentParser(description="使用真实资料和当前配置验证 AI 研究能力，research/collect/revise/resume 会调用 API")
+    parser.add_argument("--stage", choices=["retrieval", "research", "collect", "revise", "resume", "reuse", "cancel", "all"], default="retrieval")
     asyncio.run(main(parser.parse_args().stage))

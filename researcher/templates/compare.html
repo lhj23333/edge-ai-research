@@ -16,7 +16,7 @@
 {% if selected %}
 <section class="panel section-space">
   <div class="panel-head"><h2>{{ icon('bars') }}比较口径</h2><span class="panel-note mono">{{ selected|length }} 款产品 · {{ rows|length }} 个维度</span></div>
-  {% if comparable %}<p class="muted">已记录相同的测试条件文本；仍需查看各来源是否使用相同版本和测量方法。</p>
+  {% if comparable %}<p class="muted">已记录相同的模型或负载、精度、批量、功耗和设备环境。请结合原始来源核对版本与测量方法。</p>
   {% else %}<div class="alert tone-warning">{{ icon('alert') }}<p>测试条件不完整或不一致，性能与功耗数字暂不能直接排名。</p></div>{% endif %}
   <div class="table-scroll section-space">
     <table class="compare-table">

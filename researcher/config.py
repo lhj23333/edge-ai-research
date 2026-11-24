@@ -3,8 +3,10 @@ import hashlib
 import json
 import os
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 
@@ -20,29 +22,57 @@ PRESETS = {
     "compatible": {"name": "OpenAI 兼容", "base_url": "", "model": "", "search": "仅基于已有资料讨论"},
 }
 
+Effort = Literal["low", "high", "max", "disabled", "default"]
+MODEL_STEPS = {
+    "prefilter": ("disabled", 512), "score": ("disabled", 1024),
+    "write": ("disabled", 1536), "cluster": ("disabled", 1024),
+    "cluster_review": ("low", 1024), "deep_plan": ("high", 8192),
+    "deep_review": ("high", 32768),
+}
+
+
+class ModelRoute(BaseModel):
+    profile_id: str | None = None
+    reasoning_effort: Effort | None = None
+    output_tokens: int | None = Field(default=None, ge=128, le=32768)
+
+
+def model_routes(values):
+    if set(values) - MODEL_STEPS.keys():
+        raise ValueError("包含未知的模型步骤")
+    return {name: ModelRoute.model_validate(values.get(name, {})).model_dump(exclude_none=True) for name in MODEL_STEPS}
+
 
 class Limits(BaseModel):
     daily_requests: int = Field(default=60, ge=1, le=10000)
     task_requests: int = Field(default=8, ge=2, le=100)
     output_tokens: int = Field(default=4096, ge=256, le=32768)
     timezone: str = "Asia/Shanghai"
+    minute_cost: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    hour_cost: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    daily_cost: float | None = Field(default=None, gt=0, allow_inf_nan=False)
 
     @field_validator("timezone")
     @classmethod
     def valid_timezone(cls, value):
-        from zoneinfo import ZoneInfo
-        ZoneInfo(value)
+        if not value.strip():
+            raise ValueError("时区不能为空，请填写有效的 IANA 时区名称")
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError) as error:
+            raise ValueError("时区无效，请填写有效的 IANA 时区名称") from error
         return value
 
 
 class ResearchSettings(BaseModel):
     query_cache_hours: int = Field(default=6, ge=1, le=24)
-    scan_requests: int = Field(default=16, ge=4, le=100)
     question_requests: int = Field(default=24, ge=4, le=100)
     revise_requests: int = Field(default=12, ge=3, le=100)
     onboard_requests: int = Field(default=8, ge=4, le=100)
     followup_requests: int = Field(default=12, ge=4, le=100)
     automatic_daily_requests: int = Field(default=36, ge=0, le=10000)
+    ingest_requests: int = Field(default=24, ge=4, le=100)
+    automatic_event_research: bool = False
     followups_per_day: int = Field(default=2, ge=0, le=20)
     max_rounds: int = Field(default=8, ge=1, le=30)
     timeout_minutes: int = Field(default=30, ge=1, le=120)
@@ -66,9 +96,10 @@ class Profile(BaseModel):
     provider: str
     base_url: HttpUrl
     model: str = Field(min_length=1, max_length=120)
-    reasoning_effort: Literal["low", "high", "max", "disabled", "default"] = "low"
+    reasoning_effort: Effort = "low"
     input_price: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     output_price: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    search_price: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     price_note: str = Field(default="", max_length=300)
     chat_verified: str | None = None
     search_verified: str | None = None
@@ -129,19 +160,47 @@ def settings():
             profile.chat_verified = None
             profile.search_verified = None
         items.append(profile.model_dump(mode="json"))
-    return {"profiles": items, "active_profile": data.get("active_profile", ""), "limits": Limits(**data.get("limits", {})).model_dump(), "research": ResearchSettings(**data.get("research", {})).model_dump()}
+    return {"profiles": items, "active_profile": data.get("active_profile", ""), "limits": Limits(**data.get("limits", {})).model_dump(), "research": ResearchSettings(**data.get("research", {})).model_dump(), "model_routes": model_routes(data.get("model_routes", {}))}
 
 
-def profiles():
-    return [Profile(**item) for item in settings()["profiles"]]
-
-
-def get_profile(profile_id=None):
-    profile_id = profile_id or settings()["active_profile"]
-    for profile in profiles():
-        if profile.id == profile_id:
-            return profile
+def get_profile(profile_id=None, config=None):
+    config = config if config is not None else settings()
+    profile_id = profile_id or config["active_profile"]
+    for item in config["profiles"]:
+        if item["id"] == profile_id:
+            return Profile(**item)
     raise ValueError("请在设置中添加并选择模型配置")
+
+
+@dataclass(frozen=True)
+class EffectiveRoute:
+    step: str
+    profile: Profile
+    reasoning_effort: Effort
+    output_tokens: int
+
+
+def resolve_route(step, *, config=None, profile_id=None, synthesis=False):
+    config = config if config is not None else settings()
+    # 恢复深研时沿用已保存的模型和请求参数。
+    route = {} if profile_id else config["model_routes"][step]
+    effort, tokens = MODEL_STEPS[step]
+    if step in {"deep_plan", "deep_review"}:
+        prefix = "synthesis" if synthesis else "planning" if step == "deep_plan" else "review"
+        effort = config["research"][prefix + "_effort"]
+        tokens = config["research"][prefix + "_output_tokens"]
+    return EffectiveRoute(step, get_profile(route.get("profile_id") or profile_id, config),
+                          route.get("reasoning_effort", effort), route.get("output_tokens", tokens))
+
+
+def describe_routes(config):
+    for step, (effort, tokens) in MODEL_STEPS.items():
+        values = config["model_routes"][step]
+        if step in {"deep_plan", "deep_review"}:
+            prefix = "planning" if step == "deep_plan" else "review"
+            effort = config["research"][prefix + "_effort"]
+            tokens = config["research"][prefix + "_output_tokens"]
+        yield {"step": step, "values": values, "effort": effort, "tokens": tokens}
 
 
 def secret(profile_id):
@@ -153,6 +212,19 @@ def secret(profile_id):
 
 def fingerprint(profile):
     values = [profile.provider, str(profile.base_url), profile.model, profile.reasoning_effort, secret(profile.id)]
+    return hashlib.sha256(json.dumps(values).encode()).hexdigest()
+
+
+def research_routes(config=None, profile_id=None):
+    config = config if config is not None else settings()
+    plan = resolve_route("deep_plan", config=config, profile_id=profile_id)
+    review = resolve_route("deep_review", config=config, profile_id=profile_id)
+    write = resolve_route("deep_plan", config=config, profile_id=profile_id, synthesis=True)
+    return plan, review, write
+
+
+def routes_fingerprint(routes):
+    values = [(route.step, route.profile.id, fingerprint(route.profile), route.reasoning_effort, route.output_tokens) for route in routes]
     return hashlib.sha256(json.dumps(values).encode()).hexdigest()
 
 

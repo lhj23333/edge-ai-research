@@ -709,14 +709,6 @@ a.list-item:hover strong { color: var(--accent-text); }
 .list-row { display: flex; align-items: center; gap: var(--space-3); }
 .list-row > :first-child { min-width: 0; flex: 1; }
 
-.signal { display: inline-flex; align-items: flex-end; gap: 2px; height: 12px; }
-.signal i { width: 3px; border-radius: 1px; background: var(--border-strong); }
-.signal i:nth-child(1) { height: 4px; }
-.signal i:nth-child(2) { height: 6px; }
-.signal i:nth-child(3) { height: 8px; }
-.signal i:nth-child(4) { height: 10px; }
-.signal i:nth-child(5) { height: 12px; }
-.signal i.on { background: var(--accent); box-shadow: 0 0 5px rgb(59 180 255 / 45%); }
 
 .bar { display: block; width: 100%; height: 6px; border-radius: var(--radius-pill); overflow: hidden; }
 .stack-bar { height: 8px; }

@@ -1,6 +1,7 @@
 {% extends 'base.html' %}
 {% from 'station_macros.html' import annotation_form, evidence_cards with context %}
-{% from 'ui.html' import icon, kind_icon, signal %}
+{% from 'ui.html' import icon, kind_icon %}
+{% from 'macros.html' import token with context %}
 {% block content %}
 <header class="page-header">
   <a class="back-link" href="/updates">{{ icon('arrow-left') }}行业动态</a>
@@ -11,8 +12,10 @@
       <span>{{ icon('calendar') }}事件发生：<span class="mono">{{ event.occurred_at or '来源未明确' }}</span></span>
       <span>来源发布：<span class="mono">{{ event.published_at or '未提供' }}</span></span>
       <span>{{ icon('clock') }}记录：<span class="mono">{{ event.created_at|localtime }}</span></span>
-      {{ signal(event.importance) }}
+      {% if event.get('first_party_confirmed') %}<span class="badge tone-success">T1 一手</span>{% endif %}
+      {% if materials and event.get('independent_source_count') is not none and event.get('heat_score') is not none %}<span>近 48 小时 {{ event.independent_source_count }} 个独立来源 · 热度 {{ '%.2f'|format(event.heat_score) }}</span>{% endif %}
     </div>
+    <div class="actions section-space"><form action="/events/{{ event.id }}/research" method="post">{{ token() }}<button class="button primary" type="submit">{{ icon('search') }}针对本事件发起 LangGraph 深度核验</button></form>{% if latest_research %}<a class="button" href="/research/{{ latest_research.session_id }}">查看已有核验</a>{% endif %}</div>
   </div>
 </header>
 
@@ -24,9 +27,16 @@
       <section><h2>竞争影响<span class="badge tone-accent">分析判断</span></h2><p>{{ event.competitive_impact or '当前证据尚不足以判断具体竞争影响。' }}</p></section>
       <p class="field-help">{{ icon('info') }}影响解释来自 AI 分析，请结合下面的证据类别、原文片段和核验状态阅读。</p>
     </article>
+    <section class="panel"><div class="panel-head"><h2>{{ icon('clock') }}多源时间线</h2>
+      {% if materials %}<a class="text-link" href="/events/{{ event.id }}?timeline={{ 'asc' if timeline=='desc' else 'desc' }}">{{ '最早优先' if timeline=='desc' else '最新优先' }}</a>{% endif %}
+    </div><div class="list">{% for entry in materials %}<article class="list-item">
+      <div class="list-row"><a href="/documents/{{ entry.document_id }}?version={{ entry.version_id }}"><strong>{{ entry.title }}</strong></a><span class="badge {{ 'tone-success' if entry.tier=='T1' else 'tone-neutral' }}">{{ entry.tier or '研究资料' }}</span></div>
+      <small>{{ entry.published_at|localtime if entry.published_at else '发布日期未确认' }}{% if entry.representative %} · 代表原文{% endif %}{% if entry.relation %} · {{ {'new_event':'首次记录','follow_up':'后续进展','same_event':'同一事件报道'}.get(entry.relation, '') }}{% endif %}</small>
+      <a class="text-link" href="{{ entry.url }}" target="_blank" rel="noopener noreferrer">查看发布页{{ icon('external') }}</a>
+    </article>{% else %}<p class="muted">尚无已归档的来源。</p>{% endfor %}</div></section>
     <section class="panel">
-      <div class="panel-head"><h2>{{ icon('evidence') }}来源与具体说法</h2><span class="panel-note mono">{{ claims|length }} 条</span></div>
-      {{ evidence_cards(claims) }}
+      <div class="panel-head"><h2>{{ icon('evidence') }}已记录的具体说法</h2><span class="panel-note mono">{{ claims|length }} 条</span></div>
+      {% if claims %}{{ evidence_cards(claims) }}{% else %}<p class="muted">深度核验完成后，这里会列出有原文片段支持的说法。</p>{% endif %}
     </section>
     {{ annotation_form('event', event.id) }}
   </div>
@@ -41,7 +51,13 @@
     <section class="panel">
       <div class="panel-head"><h2>{{ icon('layers') }}专题与认知变化</h2></div>
       <div class="list">
-        {% for topic in topics %}<a class="list-item" href="/knowledge/{{ topic.id }}"><strong>{{ topic.title }}</strong><small>{{ topic.impact }}</small></a>{% endfor %}
+        {% for topic in topics %}<article class="list-item">
+          <a href="/knowledge/{{ topic.id }}"><strong>{{ topic.title }}</strong></a><small>{{ topic.impact }}</small>
+          {% if topic.refresh_reason %}
+          <p>{{ topic.refresh_reason }}可使用已归档的本地证据更新行业竞争与部署决策判断，无需联网搜索。</p>
+          <form method="post" action="/knowledge/{{ topic.id }}/revise">{{ token() }}<input type="hidden" name="event_id" value="{{ event.id }}"><button class="button primary" type="submit">{{ icon('refresh') }}刷新相关专题判断</button></form>
+          {% endif %}
+        </article>{% endfor %}
         {% for revision in revisions %}<a class="list-item" href="/knowledge/{{ revision.topic_id }}"><strong>{{ revision.topic_title }} · {{ revision.purpose }}</strong><small><span class="badge dot tone-{{ revision.status|tone }}">{{ revision.status }}</span> {{ revision.reason }}</small></a>{% endfor %}
         {% if not topics and not revisions %}<p class="muted">尚无可确认的专题影响。</p>{% endif %}
       </div>

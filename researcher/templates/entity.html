@@ -63,6 +63,7 @@
   </div>
 
   <aside class="stack">
+    {% if official_sources %}<section class="panel"><div class="panel-head"><h2>{{ icon('link') }}T1 官方信源</h2></div><div class="list">{% for source in official_sources %}<a class="list-item" href="{{ source.url or ('/admin/sources?edit=' ~ source.id) }}"><strong>{{ source.name }}</strong><small>{{ '已启用采集' if source.enabled else '暂未启用' }}</small></a>{% endfor %}</div></section>{% endif %}
     <section class="panel">
       <div class="panel-head"><h2>{{ icon('link') }}关联关系</h2></div>
       <div class="list">

@@ -57,7 +57,7 @@
   {% if back_href %}<a class="back-link" href="{{ back_href }}">{{ icon('arrow-left') }}{{ back_label }}</a>{% endif %}
   <div class="page-header-row">
     <div class="page-title">
-      <p class="eyebrow">{{ eyebrow }}</p>
+      {% if eyebrow %}<p class="eyebrow">{{ eyebrow }}</p>{% endif %}
       <h1>{{ title }}</h1>
       {% if lead %}<p class="lead">{{ lead }}</p>{% endif %}
     </div>
@@ -73,12 +73,6 @@
   {% if text %}<p>{{ text }}</p>{% endif %}
   {% if caller is defined %}{{ caller() }}{% endif %}
 </div>
-{%- endmacro %}
-
-{% macro signal(level, total=5) -%}
-<span class="signal" role="img" aria-label="重要性 {{ level }} / {{ total }}" title="重要性 {{ level }} / {{ total }}">
-  {%- for index in range(total) %}<i class="{{ 'on' if index < level else '' }}"></i>{% endfor -%}
-</span>
 {%- endmacro %}
 
 {% macro bar(value, maximum, tone='accent') -%}

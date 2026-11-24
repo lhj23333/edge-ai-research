@@ -1,0 +1,54 @@
+{% extends 'base.html' %}
+{% from 'macros.html' import token with context %}
+{% from 'ui.html' import icon, page_header, empty %}
+{% block content %}
+{% call page_header('', '信源管理', '查看采集状态、配置分级与监控起点，并在保存前验证列表和发布日期。') %}
+  <a class="button" href="/admin/funnel">漏斗诊断{{ icon('arrow-right') }}</a>
+{% endcall %}
+<div class="layout-split">
+  <div class="stack">
+    {% if preview_rows is not none %}<section class="panel" id="preview"><div class="panel-head"><h2>预览结果</h2><span class="panel-note">{{ preview_rows|length }} 条</span></div><div class="list">
+      {% for row in preview_rows %}<article class="list-item"><a href="{{ row.url }}" target="_blank" rel="noopener noreferrer">{{ row.title }}</a><small>{{ row.published_at|localtime if row.published_at else '发布日期未确认' }} · {{ states[row.state] }}{% if row.gate_reason %} · {{ reasons.get(row.gate_reason, row.gate_reason) }}{% endif %}{% if row.error %} · {{ row.error }}{% endif %}</small></article>
+      {% else %}<p class="muted">当前配置没有匹配的条目。</p>{% endfor %}
+    </div></section>{% endif %}
+    <section class="panel"><div class="panel-head"><h2>{{ '已归档信源' if archived else '受控信源' }}</h2>
+      {% if archived %}<a class="text-link" href="/admin/sources">返回运营列表</a>
+      {% else %}<div class="actions"><a class="text-link" href="/admin/sources?archived=true">查看已归档</a><a class="text-link" href="/admin/sources">添加信源{{ icon('plus') }}</a></div>{% endif %}
+    </div><div class="list">
+      {% for source in sources %}<article class="list-item"><div class="list-row">
+        {% if source.archived_at %}<strong>{{ source.name }}</strong>{% else %}<a href="/admin/sources?edit={{ source.id }}"><strong>{{ source.name }}</strong></a>{% endif %}
+        <span class="badge {{ 'tone-success' if source.enabled else 'tone-neutral' }}">{{ '已归档' if source.archived_at else ('启用' if source.enabled else '停用') }}</span></div>
+        <small>{{ source.tier }} · {{ source.kind }}{% if source.owner_name %} · {{ source.owner_name }}{% endif %} · 入选 {{ source.selected_count }}/{{ source.item_count }}</small>
+        {% if source.archived_at %}<small>归档时间 {{ source.archived_at|localtime }}</small>
+        {% elif source.kind != 'external' %}<small>轮询间隔 {{ source.poll_minutes }} 分钟{% if source.next_poll_at %} · 下次 {{ source.next_poll_at|localtime }}{% endif %}</small>
+        {% else %}<small class="mono">POST /admin/sources/{{ source.id }}/push</small>{% endif %}
+        {% if source.cadence_days %}<small>近 90 天发文间隔中位数 {{ '%g'|format(source.cadence_days) }} 天</small>{% endif %}
+        {% if source.cadence_stale %}<small class="badge tone-danger">发布间隔超出历史节奏</small>{% endif %}
+        {% if source.consecutive_failures %}<small class="badge tone-danger">连续失败 {{ source.consecutive_failures }} 次 · {{ source.latest_error }}</small>{% endif %}
+        {% set action = 'restore' if source.archived_at else ('archive' if source.has_history else 'delete') %}
+        <form action="/admin/sources/{{ source.id }}/{{ action }}" method="post">{{ token() }}
+          <button class="button" type="submit">{{ '恢复为停用' if source.archived_at else ('归档' if source.has_history else '删除无历史信源') }}</button>
+        </form>
+      </article>{% else %}{{ empty('尚无已归档信源' if archived else '尚无信源') }}{% endfor %}
+    </div></section>
+  </div>
+  <section class="panel"><div class="panel-head"><h2>{{ '编辑信源' if edit_id else '添加信源' }}</h2></div>
+    <form action="/admin/sources" method="post" class="stack-form">{{ token() }}
+      {% if edit_id %}<input type="hidden" name="source_id" value="{{ edit_id }}">{% endif %}
+      <label>信源名称<input name="name" value="{{ draft.name }}" required maxlength="150"></label>
+      <div class="field-row"><label>唯一标识<input name="key" value="{{ draft.key }}" required pattern="[a-z0-9][a-z0-9_\-]{0,79}" {{ 'readonly' if edit_id }}></label><label>发布者标识<input name="publisher" value="{{ draft.publisher }}" maxlength="150" required></label></div>
+      <div class="field-row"><label>类型<select name="kind">{% for kind in ['rss','web_list','json_list','external'] %}<option {{ 'selected' if draft.kind==kind }}>{{ kind }}</option>{% endfor %}</select></label><label>分级<select name="tier">{% for tier in ['T1','T1.5','T2'] %}<option {{ 'selected' if draft.tier==tier }}>{{ tier }}</option>{% endfor %}</select></label></div>
+      <label>列表地址<input name="url" type="url" value="{{ draft.url }}"><small>外部推送类型留空。</small></label>
+      <div class="field-row"><label>归属厂商<input name="owner" value="{{ draft.owner or '' }}" maxlength="120"></label><label>评分类别<input name="category" value="{{ draft.category }}" maxlength="80"></label></div>
+      <label>监控起点<input name="published_after" value="{{ draft.published_after or '' }}" placeholder="ISO 日期或日期时间"></label>
+      <label>官方文章 URL 前缀<textarea name="publisher_prefixes" rows="2" placeholder="每行一个地址">{{ draft.publisherUrlPrefixes|default([])|join('\n') }}</textarea></label>
+      <details {% if draft.kind in ['web_list','json_list','external'] %}open{% endif %}><summary>列表解析与推送预览</summary>
+        <label>解析选项（JSON）<textarea name="options" class="mono" rows="5" spellcheck="false">{{ draft.options|default('{}') }}</textarea><small>网页列表使用 item、url、title、date 和 detail_date CSS 选择器。JSON 列表使用字段路径。</small></label>
+        <label>外部条目（JSON 数组，仅用于预览）<textarea name="entries" class="mono" rows="3" spellcheck="false" placeholder="[]"></textarea></label>
+      </details>
+      <label class="check-row"><input name="enabled" type="checkbox" value="yes" {{ 'checked' if draft.enabled }}>启用此信源</label>
+      <div class="actions"><button class="button" type="submit" formaction="/admin/sources/preview">预览前 20 条</button><button class="button primary" type="submit">保存信源</button></div>
+    </form>
+  </section>
+</div>
+{% endblock %}
