@@ -200,31 +200,46 @@ def finish_gap(task, complete):
 def feedback(session_id, task_id, kind, body="", item_id=None):
     if kind not in {"useful", "irrelevant", "incorrect", "outdated"}:
         raise ValueError("反馈类型无效")
-    task = db.one("SELECT result_json,job_json FROM tasks WHERE id=? AND session_id=?", (task_id, session_id))
-    if not task:
-        raise ValueError("研究结果不存在")
-    result = station.decode(task["result_json"])
-    private = bool(station.decode(task["job_json"]).get("selected_note_ids"))
-    identifiers = [] if private else list({item["id"] for item in (continuity.canonical_knowledge(identifier) for identifier in result.get("knowledge_ids", [])) if item})
-    if item_id is not None:
-        item = continuity.canonical_knowledge(item_id)
-        if not item:
-            raise ValueError("知识编号不存在")
-        item_id = item["id"]
-    if item_id is not None and item_id not in identifiers:
-        raise ValueError("知识编号不属于该研究结果")
-    db.execute("INSERT INTO research_feedback(session_id,task_id,item_id,kind,body,created_at) VALUES(?,?,?,?,?,?)", (session_id, task_id, item_id, kind, body, db.now()))
-    if private:
-        return
-    documents = set(result.get("document_ids", []))
-    for experience in db.query("SELECT id,document_ids_json FROM research_experiences"):
-        if documents & set(station.decode(experience["document_ids_json"])):
-            db.execute("UPDATE research_experiences SET useful_count=useful_count+?,failure_count=failure_count+?,last_result=? WHERE id=?", (int(kind == "useful"), int(kind != "useful"), {"useful": "用户反馈：相关研究有帮助", "irrelevant": "用户反馈：相关研究无关", "incorrect": "用户反馈：相关研究需要纠正", "outdated": "用户反馈：相关资料已经过时"}[kind], experience["id"]))
-    if kind in {"incorrect", "outdated"}:
-        from .knowledge import invalidate
-        affected = [item_id] if item_id else identifiers
-        for identifier in affected:
-            for document in db.query("SELECT DISTINCT c.document_id FROM knowledge_evidence ke JOIN claims c ON c.id=ke.claim_id WHERE ke.item_id=?", (identifier,)):
-                invalidate(document["document_id"], "用户指出研究结果需要重新核验：" + body)
-        for gap_id in result.get("gap_ids", []):
-            db.execute("UPDATE research_gaps SET status='open',next_check_at=?,updated_at=? WHERE id=? AND status!='paused'", (db.now(), db.now(), gap_id))
+    with db.transaction() as connection:
+        task = connection.execute("SELECT result_json,job_json,topic_id FROM tasks WHERE id=? AND session_id=?", (task_id, session_id)).fetchone()
+        if not task:
+            raise ValueError("研究结果不存在")
+        result = station.decode(task["result_json"]) or {}
+        job = station.decode(task["job_json"])
+        private = bool(job.get("selected_note_ids"))
+        identifiers = set()
+        if not private:
+            for identifier in result.get("knowledge_ids") or []:
+                item = continuity.canonical_knowledge(identifier, connection=connection)
+                if item:
+                    identifiers.add(item["id"])
+        if item_id is not None:
+            item = continuity.canonical_knowledge(item_id, connection=connection)
+            if not item:
+                raise ValueError("知识编号不存在")
+            item_id = item["id"]
+            if item_id not in identifiers:
+                raise ValueError("知识编号不属于该研究结果")
+        timestamp = db.now()
+        connection.execute("INSERT INTO research_feedback(session_id,task_id,item_id,kind,body,created_at) VALUES(?,?,?,?,?,?)", (session_id, task_id, item_id, kind, body, timestamp))
+        if private:
+            return
+        documents = set(result.get("document_ids") or [])
+        for experience in connection.execute("SELECT id,document_ids_json FROM research_experiences"):
+            if documents & set(station.decode(experience["document_ids_json"])):
+                connection.execute("UPDATE research_experiences SET useful_count=useful_count+?,failure_count=failure_count+?,last_result=? WHERE id=?", (int(kind == "useful"), int(kind != "useful"), {"useful": "用户反馈：相关研究有帮助", "irrelevant": "用户反馈：相关研究无关", "incorrect": "用户反馈：相关研究需要纠正", "outdated": "用户反馈：相关资料已经过时"}[kind], experience["id"]))
+        if kind in {"incorrect", "outdated"}:
+            from .knowledge import invalidate
+
+            affected = [item_id] if item_id is not None else sorted(identifiers)
+            rows = connection.execute("SELECT DISTINCT c.document_id FROM knowledge_evidence ke JOIN claims c ON c.id=ke.claim_id "
+                                      "WHERE ke.item_id IN (SELECT value FROM json_each(?))", (station.encode(affected),)).fetchall()
+            for document in rows:
+                invalidate(document["document_id"], "用户指出研究结果需要重新核验：" + body, connection=connection)
+            topic_id = job.get("topic_id") or task["topic_id"]
+            target_kind = job.get("target_kind", "topic" if topic_id else None)
+            target_id = job.get("target_id") or topic_id
+            connection.execute("DELETE FROM research_evidence_versions WHERE task_id=? OR (target_kind=? AND target_id=?)",
+                               (task_id, target_kind, target_id))
+            connection.executemany("UPDATE research_gaps SET status='open',next_check_at=?,updated_at=? WHERE id=? AND status!='paused'",
+                                   ((timestamp, timestamp, gap_id) for gap_id in result.get("gap_ids") or []))

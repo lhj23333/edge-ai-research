@@ -9,7 +9,7 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import END, START, StateGraph
 
 from . import continuity, db, knowledge, research, station
-from .config import COST_PROFILES, DATA, ResearchSettings, legacy_research_parameters, settings
+from .config import COST_PROFILES, DATA, ResearchSettings, legacy_research_parameters, routes_fingerprint, settings
 from .industry import selection
 from .providers import BudgetExceeded, Cancelled, Gateway, ResearchError, UnknownOutcome, yield_to_manual
 from .research_models import Draft, DraftSubmission, Finding, LEGACY_PROMPT_VERSION, LegacyWebQuery, PLANNING, Point, PROMPT_VERSION, SYNTHESIS, Review, TOOLS, tool_definitions
@@ -37,6 +37,14 @@ class State(TypedDict, total=False):
     degraded_detail: str
 
 
+def supported_knowledge(connection, result):
+    for identifier in result.get("knowledge_ids") or []:
+        item = continuity.canonical_knowledge(identifier, connection=connection)
+        if not item or item["status"] != "supported":
+            return False
+    return True
+
+
 class ResearchRun:
     def __init__(self, task):
         self.task = task
@@ -44,9 +52,11 @@ class ResearchRun:
         config = settings()
         self.config = ResearchSettings(**config["research"])
         self.legacy_parameters = legacy_research_parameters(config)
-        self.cost = COST_PROFILES[self.job.get("cost_profile", config["cost_profile"])]
+        self.cost_profile = self.job.get("cost_profile", config["cost_profile"])
+        self.cost = COST_PROFILES[self.cost_profile]
         self.legacy = "routes_fingerprint" not in self.job
         plan, review, write = research.check_routes(task, config)
+        self.routes_fingerprint = self.job.get("routes_fingerprint") or routes_fingerprint((plan, review, write))
         self.gateway = Gateway(plan.profile, task["id"], plan, legacy_research=self.legacy)
         self.reviewer = Gateway(review.profile, task["id"], review, legacy_research=self.legacy)
         self.writer = Gateway(write.profile, task["id"], write, legacy_research=self.legacy)
@@ -98,20 +108,29 @@ class ResearchRun:
             return None
         with db.open_database() as connection:
             connection.execute("BEGIN")
-            self.evidence_hash = continuity.evidence_hash(connection, self.target_kind, self.target_id)
-            prior = connection.execute(
-                "SELECT t.id,t.result_json FROM research_evidence_versions v JOIN tasks t ON t.id=v.task_id "
-                "WHERE v.target_kind=? AND v.target_id=? AND v.request_hash=? AND v.evidence_hash=? AND t.status='success'",
-                (self.target_kind, self.target_id, self.evidence_request(), self.evidence_hash),
-            ).fetchone()
-        if prior:
-            result = station.decode(prior["result_json"])
+            return self.cached_evidence(connection)
+
+    def cached_evidence(self, connection):
+        self.evidence_hash = continuity.evidence_hash(connection, self.target_kind, self.target_id)
+        prior = connection.execute(
+            "SELECT t.id,t.result_json FROM research_evidence_versions v JOIN tasks t ON t.id=v.task_id "
+            "WHERE v.target_kind=? AND v.target_id=? AND v.request_hash=? AND v.evidence_hash=? AND t.status='success'",
+            (self.target_kind, self.target_id, self.evidence_request(), self.evidence_hash),
+        ).fetchone()
+        if not prior:
+            return None
+        result = station.decode(prior["result_json"])
+        if result and supported_knowledge(connection, result):
             return {**result, "evidence_hash": self.evidence_hash, "skipped_reason": "evidence_unchanged",
                     "reused_task_id": prior["id"], "changes": []}
+        return None
 
     def evidence_request(self):
+        policy = {"cost_profile": self.cost_profile, "web_pages": self.cost.web_pages, "review_rounds": self.cost.review_rounds,
+                  "max_rounds": self.config.max_rounds, "context_chunks": self.config.context_chunks,
+                  "routes_fingerprint": self.routes_fingerprint}
         return continuity.digest([continuity.processing_context(self.job), self.task.get("context_brief"),
-                                  self.job.get("trigger_event_id"), self.job.get("chunk_ids"), self.scope])
+                                  self.job.get("trigger_event_id"), self.job.get("chunk_ids"), self.scope, policy])
 
     def saved_request(self, key):
         previous = db.one("SELECT * FROM research_operations WHERE task_id=? AND operation_key=?", (self.task["id"], "request_inputs:" + key))
@@ -664,8 +683,12 @@ class ResearchRun:
         self.finish_result(result, body)
         return {"outcome": result}
 
-    def finish_result(self, result, body):
+    def finish_result(self, result, body, *, verify_cached_evidence=False):
         with db.transaction() as connection:
+            if verify_cached_evidence:
+                current = self.cached_evidence(connection)
+                if current != result:
+                    return False
             if self.task["kind"] == "onboard" and not self.private:
                 result["companies"] = connection.execute("SELECT count(*) FROM watchlist_proposals WHERE kind='company'").fetchone()[0]
                 result["topics"] = connection.execute("SELECT count(*) FROM watchlist_proposals WHERE kind='topic'").fetchone()[0]
@@ -680,19 +703,21 @@ class ResearchRun:
             if (self.evidence_hash is not None and not result.get("skipped_reason")
                     and result.get("degraded_reason") in {None, "review_round_limit"}
                     and not result.get("needs_input")
+                    and supported_knowledge(connection, result)
                     and self.evidence_hash == continuity.evidence_hash(connection, self.target_kind, self.target_id)):
                 connection.execute("INSERT INTO research_evidence_versions VALUES(?,?,?,?,?) "
                                    "ON CONFLICT(target_kind,target_id,request_hash) DO UPDATE SET evidence_hash=excluded.evidence_hash,task_id=excluded.task_id",
                                    (self.target_kind, self.target_id, self.evidence_request(), self.evidence_hash, self.task["id"]))
         if self.private:
-            return
+            return True
         research.finish_gap(self.task, result["complete"])
         if result.get("skipped_reason"):
-            return
+            return True
         used_documents = set(result["document_ids"])
         for experience in db.query("SELECT id,document_ids_json FROM research_experiences"):
             if set(station.decode(experience["document_ids_json"])) & used_documents:
                 db.execute("UPDATE research_experiences SET useful_count=useful_count+?,failure_count=failure_count+? WHERE id=?", (int(bool(result["knowledge_ids"])), int(not result["complete"]), experience["id"]))
+        return True
 
     def reusable_result(self):
         if self.task["kind"] not in {"interactive", "question"} or self.private or self.job.get("force_refresh") or any(word in self.goal for word in ("最新", "今日", "近期", "最近")):
@@ -768,9 +793,9 @@ async def perform(task):
     reused = run.unchanged_evidence()
     if reused:
         run.checkpoint("底层证据未变化，复用已有研究")
-        run.record("复用证据版本", outputs={"task_id": reused["reused_task_id"], "evidence_hash": run.evidence_hash})
-        run.finish_result(reused, reused["answer"])
-        return
+        if run.finish_result(reused, reused["answer"], verify_cached_evidence=True):
+            run.record("复用证据版本", outputs={"task_id": reused["reused_task_id"], "evidence_hash": run.evidence_hash})
+            return
     reused = run.reusable_result()
     if reused:
         run.record("复用有效研究", outputs={"task_id": reused["reused_task_id"], "knowledge_ids": reused["knowledge_ids"]})

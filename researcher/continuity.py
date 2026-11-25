@@ -161,15 +161,16 @@ async def cached_operation(kind, inputs, context, task_id, produce, force=False,
     raise ResearchError("相同资料正在由其他操作获取，请等待该操作完成")
 
 
-def canonical_knowledge(identifier):
+def canonical_knowledge(identifier, *, connection=None):
     seen = set()
+    query = "SELECT * FROM knowledge_items WHERE id=?"
     while identifier:
         if identifier in seen:
             raise ValueError("知识合并记录存在循环")
         seen.add(identifier)
-        row = db.one("SELECT * FROM knowledge_items WHERE id=?", (identifier,))
+        row = db.one(query, (identifier,)) if connection is None else connection.execute(query, (identifier,)).fetchone()
         if not row or not row["canonical_item_id"]:
-            return row
+            return dict(row) if row else None
         identifier = row["canonical_item_id"]
     return None
 

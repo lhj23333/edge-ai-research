@@ -7,7 +7,7 @@ import os
 import socket
 import sqlite3
 import threading
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -363,8 +363,8 @@ def current_version(document_id):
     return version["id"] if version else None
 
 
-def invalidate(document_id, reason):
-    with db.transaction() as connection:
+def invalidate(document_id, reason, *, connection=None):
+    with (db.transaction() if connection is None else nullcontext(connection)) as connection:
         ids = [row[0] for row in connection.execute("SELECT DISTINCT ke.item_id FROM knowledge_evidence ke JOIN claims c ON c.id=ke.claim_id WHERE c.document_id=?", (document_id,))]
         for identifier in ids:
             item = connection.execute("SELECT * FROM knowledge_items WHERE id=?", (identifier,)).fetchone()
@@ -374,6 +374,19 @@ def invalidate(document_id, reason):
             connection.execute("UPDATE knowledge_items SET status='needs_review',revision=?,updated_at=? WHERE id=?", (version, db.now(), identifier))
             connection.execute("INSERT INTO knowledge_versions(item_id,version,body,status,reason,created_at) VALUES(?,?,?,'needs_review',?,?)", (identifier, version, item["body"], reason, db.now()))
         connection.execute("UPDATE judgments SET status='待核实' WHERE current_version_id IN (SELECT je.version_id FROM judgment_evidence je JOIN claims c ON c.id=je.claim_id WHERE c.document_id=?)", (document_id,))
+        connection.execute("""
+            WITH RECURSIVE affected(id) AS (
+                SELECT ke.item_id FROM knowledge_evidence ke JOIN claims c ON c.id=ke.claim_id WHERE c.document_id=?
+                UNION SELECT k.id FROM knowledge_items k JOIN affected a ON k.canonical_item_id=a.id
+            )
+            DELETE FROM research_evidence_versions AS v
+            WHERE EXISTS (
+                SELECT 1 FROM tasks t WHERE t.id=v.task_id AND (
+                    EXISTS (SELECT 1 FROM json_each(t.result_json,'$.knowledge_ids') j JOIN affected a ON a.id=j.value)
+                    OR EXISTS (SELECT 1 FROM json_each(t.result_json,'$.document_ids') WHERE value=?)
+                )
+            )
+        """, (document_id, document_id))
 
 
 async def public_target(value, allowed_hosts=()):
