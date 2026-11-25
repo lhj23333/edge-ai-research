@@ -3,7 +3,7 @@ import hashlib
 
 from . import continuity, db, knowledge, station
 from .config import fingerprint, mark_verified
-from .providers import ResearchError
+from .providers import BudgetExceeded, ResearchError
 from .research_models import CompletionReview, Draft, EvidenceReview, FindingReview, PointReview, REVIEW, Review, UpdateReview
 
 
@@ -48,6 +48,24 @@ def references(category, item):
     return {item.finding_ref}
 
 
+UPDATE_CATEGORIES = ("events", "judgments", "fields", "relations", "proposals", "gaps")
+
+
+def partial_review(draft, detail, findings=None, points=None, updates=None):
+    findings, points, updates = findings or {}, points or {}, updates or {}
+    deferred = [item.ref for item in draft.findings if item.ref not in findings]
+    return Review(
+        findings=[findings[ref] if ref in findings else FindingReview(ref=ref, verdict="insufficient", reason=detail)
+                  for ref in (item.ref for item in draft.findings)],
+        points=[points[index] if index in points else PointReview(index=index, verdict="insufficient", reason=detail)
+                for index in range(len(draft.points))],
+        updates=[updates[(category, index)] if (category, index) in updates
+                 else UpdateReview(category=category, index=index, verdict="insufficient", reason=detail)
+                 for category in UPDATE_CATEGORIES for index in range(len(getattr(draft, category)))],
+        completion_satisfied=False, completion_notes=detail, deferred_refs=deferred,
+    )
+
+
 async def prepare_payload(run, key, payload):
     async def build():
         return payload
@@ -88,14 +106,15 @@ async def submit(run, payload, model, name, operation):
 
 async def review(run, state):
     draft = Draft.model_validate(state["draft"])
+    if state.get("degraded_reason"):
+        return {"review": state.get("review") or partial_review(draft, state["degraded_detail"]).model_dump()}
     if not draft.findings and not draft.points:
         return {"review": Review(findings=[], points=[], completion_satisfied=False).model_dump()}
     run.checkpoint("逐条检查说法、条件和原文支持程度")
     findings = {item.ref: item for item in draft.findings}
     chunks = {item["chunk_id"]: item for item in state["chunks"]}
-    checked_findings, checked_points, checked_updates, deferred = {}, {}, {}, []
-    pending_updates = [(category, index, item) for category in ("events", "judgments", "fields", "relations", "proposals", "gaps") for index, item in enumerate(getattr(draft, category))]
-    # 按请求摘要复用核验，同一编号可对应不同草稿内容。
+    checked_findings, checked_points, checked_updates = {}, {}, {}
+    pending_updates = [(category, index, item) for category in UPDATE_CATEGORIES for index, item in enumerate(getattr(draft, category))]
 
     async def unit(facts, points, updates):
         refs = {item.ref for item in facts}
@@ -115,23 +134,15 @@ async def review(run, state):
         payload["instruction"] += "分析回答已有语义相同的研究分析时，在 PointReview.existing_knowledge_id 引用 existing_point_knowledge 中的编号。专题判断只是改写当前结论、边界及未解决问题时，UpdateReview.has_change=false；有依据的认识变化才填写 true。已有知识 needs_review 时检查 review_history 和 feedback，只有当前原文及条件确实解决原核验问题时 revalidated=true；仅增加来源或改写表述不能恢复有效状态。"
         payload["instruction"] += "候选的 merge_compatible 是服务器对适用条件的检查结果；false 时禁止将该候选判为 existing。需要修订或记录冲突时使用 updated 或 conflict，没有相同事实时 existing_knowledge_id=null 且 change_type=new。"
         payload["instruction"] += 'findings 只返回 draft.findings 的 ref，不重复返回 context_findings。原说法 partial 时，在 supported_statement 写出本批原文确实支持的完整表述，删除不成立或对象范围不同的部分；没有可保留的独立事实时填 JSON 空字符串 ""。其他 verdict 的 supported_statement 也填 ""。回答及更新依据 verified_findings 核验，不能重复使用已经被排除的部分。'
-        for category in ("events", "judgments", "fields", "relations", "proposals", "gaps"):
+        for category in UPDATE_CATEGORIES:
             exclude = {"existing_event_id"} if run.legacy and category == "events" else None
             payload["draft"][category] = [{**item.model_dump(exclude=exclude), "index": index} for kind, index, item in updates if kind == category]
         identity = continuity.digest({key: payload[key] for key in ("draft", "context_findings", "evidence", "verified_findings")})
         payload = await prepare_payload(run, f"evidence_review:{run.prompt_version}:{identity}", payload)
         operation_key = "evidence_review:" + hashlib.sha256(station.encode(payload).encode()).hexdigest()[:24]
         cached = db.one("SELECT id FROM research_operations WHERE task_id=? AND operation_key=? AND status='success'", (run.task["id"], operation_key))
-        if run.gateway.remaining() <= 1 and not cached:
-            reason = "服务器额度检查：此项尚未完成核验，已保留原文和草稿"
-            for item in facts:
-                checked_findings[item.ref] = FindingReview(ref=item.ref, verdict="insufficient", reason=reason)
-                deferred.append(item.ref)
-            for index, item in points:
-                checked_points[index] = PointReview(index=index, verdict="insufficient", reason=reason)
-            for category, index, item in updates:
-                checked_updates[(category, index)] = UpdateReview(category=category, index=index, verdict="insufficient", reason=reason)
-            return
+        if not run.gateway.remaining() and not cached:
+            raise run.gateway.exhausted_budget()
         result = await submit(run, payload, EvidenceReview, "record_evidence_review", "evidence_review")
 
         def reject(message):
@@ -178,30 +189,38 @@ async def review(run, state):
         existing = next((item for item in state.get("memory", {}).get("knowledge", []) if item["status"] == "supported" and continuity.content_identity(item["body"]) == continuity.content_identity(finding.statement) and continuity.compatible_conditions(station.decode(item["conditions_json"]), finding.conditions)), None)
         if evidence and all(evidence) and existing and all(knowledge.current_version(chunks[identifier]["document_id"]) == chunks[identifier]["version_id"] for identifier in finding.chunk_ids):
             checked_findings[finding.ref] = FindingReview(ref=finding.ref, verdict="supported", reason=evidence[0]["reason"], existing_knowledge_id=existing["id"], change_type="existing", dedup_reason="相同事实、条件和原文版本已完成核验，复用既有核验结果")
-    pending = [item for item in draft.findings if item.ref not in checked_findings]
-    while pending:
-        batch = pending[:4]
-        source_ids = {identifier for item in batch for identifier in item.chunk_ids}
-        if sum(len(chunks[identifier]["content"]) for identifier in source_ids) > 8000:
-            batch = pending[:2]
-        refs = {item.ref for item in batch}
-        attached = [item for item in pending_updates if references(item[0], item[2]) and references(item[0], item[2]) <= refs][:4]
-        await unit(batch, [], attached)
-        pending = pending[len(batch):]
-        pending_updates = [item for item in pending_updates if item not in attached]
-    pending_points = [(index, item) for index, item in enumerate(draft.points) if index not in checked_points]
-    while pending_points:
-        batch = pending_points[:2]
-        refs = {ref for _, point in batch for ref in point.finding_refs}
-        source_ids = {identifier for ref in refs for identifier in findings[ref].chunk_ids}
-        if sum(len(chunks[identifier]["content"]) for identifier in source_ids) > 12000:
-            batch = pending_points[:1]
-        await unit([], batch, [])
-        pending_points = pending_points[len(batch):]
-    while pending_updates:
-        batch = pending_updates[:2]
-        await unit([], [], batch)
-        pending_updates = pending_updates[len(batch):]
+    def degraded(error):
+        result = partial_review(draft, str(error), checked_findings, checked_points, checked_updates)
+        run.record("逐项证据核验", outputs=result.model_dump())
+        return {"review": result.model_dump(), "degraded_reason": error.reason, "degraded_detail": str(error)}
+
+    try:
+        pending = [item for item in draft.findings if item.ref not in checked_findings]
+        while pending:
+            batch = pending[:4]
+            source_ids = {identifier for item in batch for identifier in item.chunk_ids}
+            if sum(len(chunks[identifier]["content"]) for identifier in source_ids) > 8000:
+                batch = pending[:2]
+            refs = {item.ref for item in batch}
+            attached = [item for item in pending_updates if references(item[0], item[2]) and references(item[0], item[2]) <= refs][:4]
+            await unit(batch, [], attached)
+            pending = pending[len(batch):]
+            pending_updates = [item for item in pending_updates if item not in attached]
+        pending_points = list(enumerate(draft.points))
+        while pending_points:
+            batch = pending_points[:2]
+            refs = {ref for _, point in batch for ref in point.finding_refs}
+            source_ids = {identifier for ref in refs for identifier in findings[ref].chunk_ids}
+            if sum(len(chunks[identifier]["content"]) for identifier in source_ids) > 12000:
+                batch = pending_points[:1]
+            await unit([], batch, [])
+            pending_points = pending_points[len(batch):]
+        while pending_updates:
+            batch = pending_updates[:2]
+            await unit([], [], batch)
+            pending_updates = pending_updates[len(batch):]
+    except BudgetExceeded as error:
+        return degraded(error)
     supported = verified_points(draft, checked_findings, checked_points)
     payload = {"prompt_version": run.prompt_version, "goal": run.goal, "completion": run.job.get("completion", "形成有来源的结论、适用条件和仍待核实的问题"), "conditions": run.job.get("conditions", {}), "investigation_stop": state["finish"], "tool_errors": state["errors"], "verified_answer_points": supported, "findings": [item.model_dump() for item in draft.findings], "finding_reviews": [item.model_dump() for item in checked_findings.values()], "update_reviews": [item.model_dump() for item in checked_updates.values()], "draft_uncertainties": draft.uncertainties, "instruction": "这里只检查已核验回答是否满足用户完成标准，并整理仍成立的实际知识缺口。不能新增事实。剔除已被原文反驳的草稿缺口；不得把分批输入说成整个任务遗漏。调查因额度停止时，仍依据实际核验内容检查完成标准；需要调查最新变化却没有执行来源检查时不能视为完成。用户要求说明未知条件时，可以通过明确说明缺口完成该要求。调用 complete_research_review。"}
     payload["sources"] = [{key: chunk[key] for key in ("chunk_id", "document_id", "version_id", "title", "url", "extent")} for chunk in chunks.values()]
@@ -210,10 +229,13 @@ async def review(run, state):
     payload = await prepare_payload(run, f"completion_review:{run.prompt_version}:{identity}", payload)
     operation_key = "completion_review:" + hashlib.sha256(station.encode(payload).encode()).hexdigest()[:24]
     cached = db.one("SELECT id FROM research_operations WHERE task_id=? AND operation_key=? AND status='success'", (run.task["id"], operation_key))
-    if run.gateway.remaining() or cached:
+    try:
+        if not run.gateway.remaining() and not cached:
+            raise run.gateway.exhausted_budget()
         completion = await submit(run, payload, CompletionReview, "complete_research_review", "completion_review")
-    else:
-        completion = CompletionReview(complete=False, notes="本次额度不足以完成整体完成标准检查，已保留通过核验的内容。", uncertainties=["整体完成标准检查尚未完成。"])
-    result = Review(findings=list(checked_findings.values()), points=list(checked_points.values()), updates=list(checked_updates.values()), completion_satisfied=completion.complete and not deferred, completion_notes=completion.notes, uncertainties=completion.uncertainties, deferred_refs=deferred)
+    except BudgetExceeded as error:
+        return degraded(error)
+    result = Review(findings=list(checked_findings.values()), points=list(checked_points.values()), updates=list(checked_updates.values()),
+                    completion_satisfied=completion.complete, completion_notes=completion.notes, uncertainties=completion.uncertainties)
     run.record("逐项证据核验", outputs=result.model_dump())
     return {"review": result.model_dump()}

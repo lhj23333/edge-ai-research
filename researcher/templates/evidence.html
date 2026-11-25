@@ -1,5 +1,5 @@
 {% extends 'base.html' %}
-{% from 'station_macros.html' import evidence_cards with context %}
+{% from 'station_macros.html' import evidence_cards, archive_links with context %}
 {% from 'ui.html' import icon, page_header %}
 {% block content %}
 {{ page_header('Sources & claims', '证据管理', '来源、具体说法、获取范围和核验状态分别保存。') }}
@@ -24,7 +24,7 @@
   <aside class="panel">
     <div class="panel-head"><h2>{{ icon('database') }}最近资料</h2><span class="panel-note mono">{{ documents|length }}</span></div>
     <div class="list">
-      {% for document in documents %}<a class="list-item" href="/documents/{{ document.id }}"><strong>{{ document.title }}</strong><small>{{ document.extent }} · 获取于 <span class="mono">{{ document.last_fetched_at|localtime }}</span></small></a>{% else %}<p class="muted">尚无资料。</p>{% endfor %}
+      {% for document in documents %}<article class="list-item"><strong>{{ document.title }}</strong><small>{{ document.extent }} · 获取于 <span class="mono">{{ document.last_fetched_at|localtime }}</span></small>{{ archive_links(document, document.id) }}</article>{% else %}<p class="muted">尚无资料。</p>{% endfor %}
     </div>
   </aside>
 </div>

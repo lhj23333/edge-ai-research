@@ -4,6 +4,7 @@ from .config import fingerprint, get_profile, settings
 STATES = {"queued": "排队中", "running": "正在研究", "success": "已完成", "failed": "执行失败", "cancelled": "已取消", "interrupted": "已中断"}
 KINDS = {"research": "历史联网研究", "chat": "历史讨论", "summary": "整理成果", "test_chat": "连接测试", "test_search": "联网测试", "onboard": "提出关注名单", "scan": "历史行业检查", "feed": "受控信源采集", "event_research": "事件深度核验", "selectbench": "SelectBench 评测", "question": "定向研究", "revise": "根据已有证据修订专题", "interactive": "探索研究", "followup": "后续问题研究"}
 KINDS["test_tools"] = "研究工具调用测试"
+KINDS["briefing"] = "今日简报"
 
 
 def enqueue_test(kind, profile_id):

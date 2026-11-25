@@ -5,6 +5,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, model_validator
 
 from .. import continuity, db, knowledge, station
+from ..config import COST_PROFILES, settings
 from ..industry import selection
 from ..providers import yield_to_manual
 from .collectors import parse_date, stamp
@@ -28,14 +29,8 @@ class Decision(BaseModel):
 
 
 def candidates_for(summary, now, policy):
-    ranked = knowledge.recall_events(summary.title + "\n" + summary.summary, now - timedelta(days=policy.cluster_days), policy.cluster_top)
-    candidates = []
-    for event_id, similarity in ranked:
-        event = db.one("SELECT e.id,e.title,e.what_happened,e.event_type,e.published_at,e.product_version,d.url "
-                       "FROM events e LEFT JOIN documents d ON d.id=e.representative_document_id WHERE e.id=? AND e.state='active' AND e.canonical_event_id IS NULL", (event_id,))
-        if event:
-            candidates.append({**event, "similarity": similarity})
-    return candidates
+    top = min(policy.cluster_top, COST_PROFILES[settings()["cost_profile"]].event_candidates)
+    return knowledge.event_candidates(summary.title + "\n" + summary.summary, now - timedelta(days=policy.cluster_days), top)
 
 
 def shortlist(candidates, policy):
@@ -130,10 +125,8 @@ def sync_event_links(connection, event_id, items, now):
             entity_ids.add(item["owner_entity_id"])
         for topic_id in data["topic_ids"]:
             topics.setdefault(topic_id, data["importance_reason"])
-    for (kind, key), name in names.items():
-        connection.execute("INSERT OR IGNORE INTO entities(kind,name,normalized_name,state,created_at,updated_at) VALUES(?,?,?,'active',?,?)",
-                           (kind, name, key, now, now))
-        entity_ids.add(connection.execute("SELECT id FROM entities WHERE kind=? AND normalized_name=?", (kind, key)).fetchone()[0])
+    for (kind, _), name in names.items():
+        entity_ids.add(station.entity(kind, name, connection=connection))
     entity_links = {row[0]: row[1] for row in connection.execute("SELECT entity_id,feed_only FROM event_entities WHERE event_id=?", (event_id,))}
     connection.executemany("DELETE FROM event_entities WHERE event_id=? AND entity_id=?",
                            ((event_id, identifier) for identifier, feed_only in entity_links.items() if feed_only and identifier not in entity_ids))
@@ -154,6 +147,12 @@ def crosses_versions(version, *target_versions):
     return bool(version and known_versions - {version})
 
 
+def assignment_reason(connection, item_id):
+    row = connection.execute("SELECT reason FROM feed_manual_reviews WHERE item_id=? AND action='assignment' ORDER BY id DESC LIMIT 1",
+                             (item_id,)).fetchone()
+    return row[0] if row else "使用人工指定的事件归属"
+
+
 def commit(item, summary, decision, candidates, reviewed, now, policy):
     timestamp = stamp(now)
     with db.transaction() as connection:
@@ -165,8 +164,14 @@ def commit(item, summary, decision, candidates, reviewed, now, policy):
         if effective_score(current) < policy.threshold(current["tier"], current["category"]):
             connection.execute("UPDATE feed_items SET state='scored_out',updated_at=? WHERE id=?", (timestamp, item["id"]))
             return None
+        manual = current["manual_target_event_id"] is not None
+        if manual:
+            decision = Decision(relation="same_event", confidence="high", event_id=current["manual_target_event_id"],
+                                reason=assignment_reason(connection, current["id"]))
         event_id = decision.event_id
         target = connection.execute("SELECT product_version FROM events WHERE id=? AND state='active' AND canonical_event_id IS NULL", (event_id,)).fetchone() if event_id else None
+        if manual and not target:
+            raise ValueError("人工指定的目标事件已失效，请重新指定归属")
         if event_id and not target:
             event_id = None
             decision = Decision(relation="new_event", confidence="high", event_id=None, reason="原候选事件已经失效，已单独保留资料")
@@ -187,19 +192,25 @@ def commit(item, summary, decision, candidates, reviewed, now, policy):
         visible_at = db.now(timespec="microseconds")
         connection.execute("UPDATE feed_items SET event_id=?,state='clustered',output_json=?,error='',next_attempt_at=NULL,updated_at=?,event_visible_at=? WHERE id=?",
                            (event_id, station.encode(data), timestamp, visible_at, item["id"]))
-        connection.execute("INSERT INTO event_cluster_decisions(item_id,candidates_json,similarity,relation,reviewed,reason,final_event_id,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                           (item["id"], station.encode(candidates), candidates[0]["similarity"] if candidates else None, decision.relation, int(reviewed), decision.reason, event_id, visible_at))
-        update_event(connection, event_id, now, policy)
+        connection.execute("INSERT INTO event_cluster_decisions(item_id,candidates_json,similarity,relation,reviewed,reason,final_event_id,created_at,manual) VALUES(?,?,?,?,?,?,?,?,?)",
+                           (item["id"], station.encode(candidates), candidates[0]["similarity"] if candidates else None, decision.relation, int(reviewed), decision.reason, event_id, visible_at, int(manual)))
+        if manual:
+            connection.execute("UPDATE events SET cluster_locked=1 WHERE id=?", (event_id,))
+        update_event(connection, event_id, now, policy, manual_assignment=manual and decision.relation == "same_event")
         return event_id
 
 
 async def assign(item, summary, call, policy):
     now = datetime.now(timezone.utc)
+    if item["manual_target_event_id"]:
+        decision = Decision(relation="same_event", confidence="high", event_id=item["manual_target_event_id"], reason="使用人工指定的事件归属")
+        return commit(item, summary, decision, [], False, now, policy)
     if item["cluster_candidates_json"] is None:
         candidates = await asyncio.to_thread(candidates_for, summary, now, policy)
         db.execute("UPDATE feed_items SET cluster_candidates_json=? WHERE id=?", (station.encode(candidates), item["id"]))
     else:
-        candidates = station.decode(item["cluster_candidates_json"])
+        top = min(policy.cluster_top, COST_PROFILES[settings()["cost_profile"]].event_candidates)
+        candidates = station.decode(item["cluster_candidates_json"])[:top]
     similar = shortlist(candidates, policy)
     reviewed = False
     if similar:
@@ -218,27 +229,36 @@ async def assign(item, summary, call, policy):
 
 
 def correct_assignment(item_id, target_id, reason):
+    from .jobs import record_review
     now = datetime.now(timezone.utc)
     policy = selection()
     # 人工归属与 cluster_locked 在同一事务中写入。
     with db.transaction() as connection:
-        item = connection.execute("SELECT * FROM feed_items WHERE id=? AND state='clustered'", (item_id,)).fetchone()
+        item = connection.execute("SELECT * FROM feed_items WHERE id=? AND state!='duplicate'", (item_id,)).fetchone()
         target = connection.execute("SELECT * FROM events WHERE id=? AND state='active' AND canonical_event_id IS NULL", (target_id,)).fetchone()
         if not item or not target:
-            raise ValueError("只能调整已聚簇条目，目标必须是有效事件")
-        old_id = item["event_id"]
-        version = station.decode(item["output_json"]).get("version")
-        relation = "follow_up" if crosses_versions(version, target["product_version"]) else "same_event"
-        visible_at = db.now(timespec="microseconds")
-        connection.execute("UPDATE feed_items SET event_id=?,updated_at=?,event_visible_at=? WHERE id=?",
-                           (target_id, stamp(now), visible_at if target_id != old_id else item["event_visible_at"], item_id))
-        connection.execute("INSERT INTO event_cluster_decisions(item_id,relation,manual,reason,final_event_id,created_at) VALUES(?,?,1,?,?,?)", (item_id, relation, reason, target_id, visible_at))
-        if relation == "follow_up":
-            connection.execute("UPDATE events SET cluster_locked=1 WHERE id=?", (target_id,))
-        for event_id in {old_id, target_id}:
-            update_event(connection, event_id, now, policy, manual_assignment=event_id != target_id or relation == "same_event")
-            connection.execute("UPDATE events SET cluster_locked=1 WHERE id=?", (event_id,))
-        if old_id != target_id:
-            merged = connection.execute("UPDATE events SET canonical_event_id=?,state='merged' WHERE id=? AND identity_key LIKE 'feed:%' AND NOT EXISTS(SELECT 1 FROM feed_items WHERE event_id=?) AND NOT EXISTS(SELECT 1 FROM event_claims WHERE event_id=?)", (target_id, old_id, old_id, old_id))
-            if merged.rowcount:
-                connection.execute("UPDATE event_aliases SET event_id=? WHERE event_id=?", (target_id, old_id))
+            raise ValueError("条目不存在或重复，目标必须是有效事件")
+        record_review(connection, item_id, "assignment", reason, event_id=target_id)
+        if item["state"] != "clustered":
+            connection.execute("UPDATE feed_items SET manual_target_event_id=?,updated_at=? WHERE id=?", (target_id, stamp(now), item_id))
+            return
+        move_assignment(connection, item, target, reason, now, policy)
+
+
+def move_assignment(connection, item, target, reason, now, policy):
+    item_id, old_id, target_id = item["id"], item["event_id"], target["id"]
+    version = station.decode(item["output_json"]).get("version")
+    relation = "follow_up" if crosses_versions(version, target["product_version"]) else "same_event"
+    visible_at = db.now(timespec="microseconds")
+    connection.execute("UPDATE feed_items SET event_id=?,manual_target_event_id=?,updated_at=?,event_visible_at=? WHERE id=?",
+                       (target_id, target_id, stamp(now), visible_at if target_id != old_id else item["event_visible_at"], item_id))
+    connection.execute("INSERT INTO event_cluster_decisions(item_id,relation,manual,reason,final_event_id,created_at) VALUES(?,?,1,?,?,?)", (item_id, relation, reason, target_id, visible_at))
+    if relation == "follow_up":
+        connection.execute("UPDATE events SET cluster_locked=1 WHERE id=?", (target_id,))
+    for event_id in {old_id, target_id}:
+        update_event(connection, event_id, now, policy, manual_assignment=event_id != target_id or relation == "same_event")
+        connection.execute("UPDATE events SET cluster_locked=1 WHERE id=?", (event_id,))
+    if old_id != target_id:
+        merged = connection.execute("UPDATE events SET canonical_event_id=?,state='merged' WHERE id=? AND identity_key LIKE 'feed:%' AND NOT EXISTS(SELECT 1 FROM feed_items WHERE event_id=?) AND NOT EXISTS(SELECT 1 FROM event_claims WHERE event_id=?)", (target_id, old_id, old_id, old_id))
+        if merged.rowcount:
+            connection.execute("UPDATE event_aliases SET event_id=? WHERE event_id=?", (target_id, old_id))

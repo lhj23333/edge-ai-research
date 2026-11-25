@@ -1,16 +1,33 @@
 {% extends 'base.html' %}
 {% from 'macros.html' import token, task_badge with context %}
+{% from 'station_macros.html' import archive_links with context %}
 {% from 'ui.html' import icon %}
 {% block content %}
+{% set feedback_types = {'useful':'有帮助','irrelevant':'内容无关','incorrect':'需要纠正','outdated':'已经过时'} %}
+{% set knowledge_states = {'supported':'有证据支持','needs_review':'需要重新核验','conflicted':'证据冲突','superseded':'已被替代'} %}
 <header class="page-header"><a class="back-link" href="/research">{{ icon('arrow-left') }}探索研究</a><div class="page-header-row"><div class="page-title"><p class="eyebrow">{{ session.purpose }} · Research / {{ session.id }}</p><h1>{{ session.title }}</h1></div>{% if task %}{{ task_badge(task) }}{% endif %}</div></header>
 <div class="layout-split">
   <div class="stack">
     {% if task and task.status in ['queued','running'] %}<section class="panel task-progress is-live" data-task-events="/tasks/{{ task.id }}/events"><h2 id="task-progress" aria-live="polite">{{ task.progress }}</h2><div class="progress-track"><div></div></div><div class="form-actions"><a class="button" href="/tasks/{{ task.id }}">查看任务和用量</a><form action="/tasks/{{ task.id }}/cancel" method="post">{{ token() }}<button class="button caution" type="submit">取消任务</button></form></div></section>{% endif %}
     {% if task and task.error %}<div class="alert tone-danger"><p>{{ task.error }} <a href="/tasks/{{ task.id }}">查看资料和继续执行</a></p></div>{% endif %}
     {% for message in messages %}<article class="panel {{ 'prose article' if message.role=='assistant' else 'compact' }}"><p class="eyebrow">{{ '研究回答' if message.role=='assistant' else '研究目标或补充' }} · {{ message.created_at|localtime }}</p>{% if message.role=='assistant' %}{{ message.body|markdown }}{% else %}<p>{{ message.body }}</p>{% endif %}</article>{% endfor %}
-    {% if result.reused_task_id %}<p class="field-help">本次复用了证据仍有效的研究任务 #{{ result.reused_task_id }}，上次检查时间为 {{ result.checked_at|localtime }}。</p>{% endif %}
+    {% if result.skipped_reason == 'evidence_unchanged' %}<p class="field-help">证据版本未变化，已复用<a href="/tasks/{{ result.reused_task_id }}">已有研究</a>。</p>
+    {% elif result.reused_task_id %}<p class="field-help">本次复用了证据仍有效的研究任务 #{{ result.reused_task_id }}，上次检查时间为 {{ result.checked_at|localtime }}。</p>{% endif %}
     {% if result.changes %}<section class="panel compact"><h2>本次知识变化</h2><div class="meta">{% for key,label in [('new','新增事实'),('evidence','补充证据'),('existing','沿用知识'),('updated','事实修订'),('conflict','证据冲突')] %}<span>{{ label }}：{{ result.changes|selectattr('change_type','equalto',key)|list|length }}</span>{% endfor %}</div></section>{% endif %}
+    {% if citations %}<section class="panel"><div class="panel-head"><h2>研究引用与归档</h2></div><div class="list">
+      {% for citation in citations %}<article class="list-item"><strong>{{ citation.title }}</strong>
+        {{ archive_links(citation, citation.document_id, citation.version_id, citation.chunk_id) }}
+      </article>{% endfor %}
+    </div></section>{% endif %}
     {% if task and task.status=='success' %}<section class="panel"><div class="panel-head"><h2>{{ icon('check-circle') }}这次研究是否有帮助？</h2></div><form action="/research/{{ session.id }}/feedback" method="post" class="stack-form">{{ token() }}<input type="hidden" name="task_id" value="{{ task.id }}"><div class="field-row"><label>反馈<select name="kind"><option value="useful">有帮助</option><option value="irrelevant">内容无关</option><option value="incorrect">需要纠正</option><option value="outdated">已经过时</option></select></label><label>针对的知识<select name="item_id"><option value="">整体结果</option>{% for item in knowledge %}<option value="{{ item.id }}">{{ item.body[:100] }}</option>{% endfor %}</select></label></div><label>说明<input name="body" maxlength="2000" placeholder="可以指出需要检查的来源或条件"></label><button class="button" type="submit">保存反馈</button></form></section>{% endif %}
+    {% if feedback %}<section class="panel"><div class="panel-head"><h2>历史反馈记录</h2></div><div class="list">
+      {% for entry in feedback %}<article class="list-item">
+        <strong>{{ feedback_types[entry.kind] }}</strong><small>{{ entry.created_at|localtime }} · <a href="/tasks/{{ entry.task_id }}">任务 #{{ entry.task_id }}</a></small>
+        {% if entry.body %}<p>{{ entry.body }}</p>{% endif %}
+        {% if entry.item %}<small>关联知识 {{ entry.item.body|truncate(120) }} · 当前核验状态：{{ knowledge_states.get(entry.item.status,entry.item.status) }}</small>
+        {% elif entry.item_id %}<small>关联知识 #{{ entry.item_id }}</small>{% else %}<small>整体结果</small>{% endif %}
+      </article>{% endfor %}
+    </div></section>{% endif %}
     {% if not task or task.status not in ['queued','running'] %}<section class="panel"><div class="panel-head"><h2>{{ icon('search') }}继续追问或补充条件</h2></div><form action="/research/{{ session.id }}/messages" method="post" class="stack-form">{{ token() }}<input type="hidden" name="purpose" value="{{ session.purpose }}"><label>补充或下一项问题<textarea name="message" rows="4" maxlength="5000" required placeholder="{{ result.needs_input or '继续研究这个问题，或说明希望进一步核实的内容。' }}"></textarea></label><label>应用场景（可选）<input name="scenario" maxlength="500"></label><label class="check-row"><input type="checkbox" name="force_refresh" value="yes"><span>检查最新资料</span></label>{% if notes %}<details><summary>选择本次使用的个人批注</summary>{% for note in notes %}<label class="check-row"><input type="checkbox" name="note_id" value="{{ note.id }}"><span>{{ note.body[:160] }}</span></label>{% endfor %}</details>{% endif %}<button class="button primary" type="submit">继续研究{{ icon('arrow-right') }}</button></form></section>{% endif %}
   </div>
   <aside class="stack">

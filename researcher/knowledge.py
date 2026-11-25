@@ -7,7 +7,7 @@ import os
 import socket
 import sqlite3
 import threading
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -115,18 +115,40 @@ def event_documents(event_id):
     """, (event_id, event_id, event_id))
 
 
+def document_access(rows):
+    identifiers = tuple({row.get("document_id") or row["id"] for row in rows})
+    if not identifiers:
+        return rows
+    status = {row["id"]: row for row in db.query("""
+        SELECT d.id, s.checked_at AS external_checked_at, f.checked_at AS fetch_failed_at, f.error AS fetch_error,
+               EXISTS(SELECT 1 FROM document_versions v JOIN source_snapshots x ON x.version_id=v.id
+                      WHERE v.document_id=d.id) AS has_snapshot
+        FROM documents d LEFT JOIN source_checks s ON s.document_id=d.id
+        LEFT JOIN document_fetch_failures f ON f.document_id=d.id
+        WHERE d.id IN (""" + ",".join("?" for _ in identifiers) + ")", identifiers)}
+    for row in rows:
+        row.update({key: value for key, value in status[row.get("document_id") or row["id"]].items() if key != "id"})
+    return rows
+
+
 def event_chunks(event_id, limit):
     documents = sorted(event_documents(event_id), key=lambda item: (not item["representative"], item["tier"] != "T1", item["tier"] != "T1.5"))
-    priority = documents[:limit]
-    if not priority:
+    versions = {}
+    for item in documents:
+        version = current_version(item["document_id"]) or item["version_id"]
+        versions.setdefault(version, len(versions))
+        if len(versions) >= limit:
+            break
+    if not versions:
         return []
-    versions = {item["version_id"]: rank for rank, item in enumerate(priority)}
     rows = db.query("SELECT id,version_id,position FROM document_chunks WHERE position<4 AND version_id IN (" + ",".join("?" for _ in versions) + ")", tuple(versions))
     rows.sort(key=lambda item: (item["position"], versions[item["version_id"]]))
     return [{**chunk_row(row["id"]), "chunk_id": row["id"]} for row in rows[:limit]]
 
 
 def ensure_index(rebuild=False, version_ids=None):
+    if not rebuild and not db.one("SELECT id FROM document_versions LIMIT 1"):
+        return {"documents": 0, "new_chunks": 0, "chunks": 0, "event_vectors": None}
     config = options()
     with INDEX_LOCK, MODEL_LOCK:
         model = embedding_model(config.embedding_model, config.device)
@@ -178,7 +200,7 @@ def ensure_index(rebuild=False, version_ids=None):
             missing = [chunk for chunk in chunks if chunk["id"] not in indexed]
             for start in range(0, len(missing), 16):
                 batch = missing[start:start + 16]
-                vectors = model.encode([item["content"] for item in batch], batch_size=8, normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=False)
+                vectors = cached_embeddings([item["content"] for item in batch], config.embedding_model, config.device)
                 with index:
                     for item, vector in zip(batch, vectors):
                         index.execute("INSERT INTO chunks_fts(rowid,title,terms) VALUES(?,?,?)", (item["id"], terms(item["title"]), terms(item["content"])))
@@ -188,13 +210,38 @@ def ensure_index(rebuild=False, version_ids=None):
         return {"documents": len(pending), "new_chunks": len(missing), "chunks": len(chunks), "event_vectors": count, "model": config.embedding_model, "device": config.device}
 
 
-def event_embeddings(texts):
+def cached_embeddings(texts, name, device):
+    namespace = "embedding:" + INDEX_VERSION + ":" + name
+    texts = tuple(texts)
+    hashes = [continuity.text_hash(value) for value in texts]
     with MODEL_LOCK:
-        model = embedding_model(EVENT_MODEL, options().device)
-        if model.get_embedding_dimension() != EVENT_DIMENSION:
-            raise ResearchError("事件向量需要 1024 维 BGE-M3 模型")
-        vectors = model.encode(texts, batch_size=8, normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=False)
-        return [np.asarray(vector, dtype=np.float32).tobytes() for vector in vectors]
+        unique = dict(zip(hashes, texts, strict=True))
+        with db.open_database() as connection:
+            vectors = {}
+            keys = list(unique)
+            for offset in range(0, len(keys), 500):
+                batch = keys[offset:offset + 500]
+                marks = ",".join("?" for _ in batch)
+                vectors.update(connection.execute(
+                    f"SELECT content_hash,value FROM content_cache WHERE namespace=? AND content_hash IN ({marks})",
+                    (namespace, *batch)))
+        missing = {key: value for key, value in unique.items() if key not in vectors}
+        if missing:
+            model = embedding_model(name, device)
+            encoded = model.encode(list(missing.values()), batch_size=8, normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=False)
+            new = {key: np.asarray(vector, dtype=np.float32).tobytes() for key, vector in zip(missing, encoded, strict=True)}
+            with db.transaction() as connection:
+                connection.executemany("INSERT OR IGNORE INTO content_cache(content_hash,namespace,value) VALUES(?,?,?)",
+                                       ((key, namespace, vector) for key, vector in new.items()))
+            vectors.update(new)
+        return [np.frombuffer(vectors[key], dtype=np.float32) for key in hashes]
+
+
+def event_embeddings(texts):
+    vectors = cached_embeddings(texts, EVENT_MODEL, options().device)
+    if any(vector.size != EVENT_DIMENSION for vector in vectors):
+        raise ResearchError("事件向量需要 1024 维 BGE-M3 模型")
+    return [vector.tobytes() for vector in vectors]
 
 
 def sync_event_vectors(active_since=None):
@@ -223,24 +270,48 @@ def sync_event_vectors(active_since=None):
         return len(rows)
 
 
-def recall_events(text, active_since, limit):
+def recall_events(text, active_since, limit, *, target_id=None):
     with INDEX_LOCK:
-        vector, = event_embeddings([text])
         if not sync_event_vectors(active_since):
-            return []
-        with closing(index_connection()) as index:
-            return [(row["event_id"], 1 - row["distance"]) for row in index.execute(
-                "SELECT event_id,distance FROM event_vectors WHERE embedding MATCH ? AND k=? AND active_at>=? ORDER BY distance",
-                (vector, limit, int(active_since.timestamp())))]
+            ranked = []
+        else:
+            vector, = event_embeddings([text])
+            with closing(index_connection()) as index:
+                ranked = [(row["event_id"], 1 - row["distance"]) for row in index.execute(
+                    "SELECT event_id,distance FROM event_vectors WHERE embedding MATCH ? AND k=? AND active_at>=? ORDER BY distance",
+                    (vector, limit, int(active_since.timestamp())))]
+    if target_id is not None:
+        ranked = [(target_id, None), *((identifier, score) for identifier, score in ranked if identifier != target_id)]
+    return ranked[:limit]
+
+
+def event_candidates(text, active_since, limit, *, target_id=None, topic_id=None):
+    fields = "SELECT e.id,e.identity_key,e.title,e.what_happened,e.event_type,e.published_at,e.product_version,d.url "
+    source = "FROM events e LEFT JOIN documents d ON d.id=e.representative_document_id "
+    active = "e.state='active' AND e.canonical_event_id IS NULL"
+    if topic_id is not None:
+        events = db.query(fields + source + "JOIN event_topics et ON et.event_id=e.id WHERE " + active + " AND et.topic_id=?", (topic_id,))
+        keywords = set(terms(text).split())
+        ranked = sorted(events, key=lambda row: (len(keywords & set(terms(row["title"] + " " + row["what_happened"]).split())),
+                                                  row["published_at"] or "", row["id"]), reverse=True)
+        return ranked[:limit]
+    candidates = []
+    for identifier, similarity in recall_events(text, active_since, limit, target_id=target_id):
+        event = db.one(fields + source + "WHERE " + active + " AND e.id=?", (identifier,))
+        if event:
+            candidates.append({**event, "similarity": similarity})
+    return candidates
 
 
 def search(query, limit=None, include_history=False):
+    if not db.one("SELECT id FROM document_versions LIMIT 1"):
+        return []
     config = options()
     limit = min(limit or config.context_chunks, 40)
     ensure_index()
     with INDEX_LOCK, MODEL_LOCK:
         model = embedding_model(config.embedding_model, config.device)
-        vector = model.encode([query], normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=False)[0]
+        vector, = cached_embeddings([query], config.embedding_model, config.device)
         with closing(index_connection(model.get_embedding_dimension())) as index:
             query_terms = list(dict.fromkeys(part for part in terms(query).split() if len(part) > 1))[:30]
             lexical = [row[0] for row in index.execute("SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ? ORDER BY bm25(chunks_fts) LIMIT 40", (" OR ".join('"' + part.replace('"', '""') + '"' for part in query_terms),))] if query_terms else []
@@ -292,8 +363,8 @@ def current_version(document_id):
     return version["id"] if version else None
 
 
-def invalidate(document_id, reason):
-    with db.transaction() as connection:
+def invalidate(document_id, reason, *, connection=None):
+    with (db.transaction() if connection is None else nullcontext(connection)) as connection:
         ids = [row[0] for row in connection.execute("SELECT DISTINCT ke.item_id FROM knowledge_evidence ke JOIN claims c ON c.id=ke.claim_id WHERE c.document_id=?", (document_id,))]
         for identifier in ids:
             item = connection.execute("SELECT * FROM knowledge_items WHERE id=?", (identifier,)).fetchone()
@@ -303,6 +374,19 @@ def invalidate(document_id, reason):
             connection.execute("UPDATE knowledge_items SET status='needs_review',revision=?,updated_at=? WHERE id=?", (version, db.now(), identifier))
             connection.execute("INSERT INTO knowledge_versions(item_id,version,body,status,reason,created_at) VALUES(?,?,?,'needs_review',?,?)", (identifier, version, item["body"], reason, db.now()))
         connection.execute("UPDATE judgments SET status='待核实' WHERE current_version_id IN (SELECT je.version_id FROM judgment_evidence je JOIN claims c ON c.id=je.claim_id WHERE c.document_id=?)", (document_id,))
+        connection.execute("""
+            WITH RECURSIVE affected(id) AS (
+                SELECT ke.item_id FROM knowledge_evidence ke JOIN claims c ON c.id=ke.claim_id WHERE c.document_id=?
+                UNION SELECT k.id FROM knowledge_items k JOIN affected a ON k.canonical_item_id=a.id
+            )
+            DELETE FROM research_evidence_versions AS v
+            WHERE EXISTS (
+                SELECT 1 FROM tasks t WHERE t.id=v.task_id AND (
+                    EXISTS (SELECT 1 FROM json_each(t.result_json,'$.knowledge_ids') j JOIN affected a ON a.id=j.value)
+                    OR EXISTS (SELECT 1 FROM json_each(t.result_json,'$.document_ids') WHERE value=?)
+                )
+            )
+        """, (document_id, document_id))
 
 
 async def public_target(value, allowed_hosts=()):
@@ -370,6 +454,10 @@ async def get_resource(client, url, *, checked=None, allowed_hosts=(), accept="*
     raise ResearchError("资料重定向次数超过限制")
 
 
+class EmptyBody(ResearchError):
+    pass
+
+
 def extract_resource(body, content_type, url):
     if "pdf" in content_type or urlsplit(url).path.lower().endswith(".pdf"):
         reader = PdfReader(io.BytesIO(body))
@@ -386,7 +474,7 @@ def extract_resource(body, content_type, url):
     if "html" in content_type:
         document = trafilatura.bare_extraction(body, url=url, include_tables=True, include_links=True, include_comments=False)
         if document is None:
-            raise ResearchError("网页没有可提取的正文")
+            raise EmptyBody("网页没有可提取的正文")
         return document.text or "", document.title or url, [], "网页原文（程序提取，未人工核验）"
     if content_type.startswith("text/") or "markdown" in content_type:
         return body.decode("utf-8"), url, [], "文本原文（程序提取，未人工核验）"
@@ -413,15 +501,33 @@ async def fetch_uncached(url, task_id):
     existing = continuity.document_for_url(url)
     checked = db.one("SELECT * FROM source_checks WHERE document_id=?", (existing["id"],)) if existing else None
     async with httpx.AsyncClient(timeout=httpx.Timeout(45, connect=15), follow_redirects=False, trust_env=False) as client:
-        resource = await get_resource(client, url, checked=checked, accept="text/html,application/pdf,text/plain,text/markdown")
+        try:
+            resource = await get_resource(client, url, checked=checked, accept="text/html,application/pdf,text/plain,text/markdown")
+        except (httpx.HTTPError, OSError) as error:
+            if existing:
+                record_fetch_failure(existing["id"], error)
+            raise
     if resource.status == 304:
-        db.execute("UPDATE source_checks SET checked_at=? WHERE document_id=?", (db.now(), checked["document_id"]))
+        mark_unchanged(checked["document_id"])
         await asyncio.to_thread(ensure_index, False, [checked["version_id"]])
         return source_result(checked["document_id"], checked["version_id"], url, change_type="existing", http_status=304)
     document_id, version_id, content = await asyncio.to_thread(archive_resource, resource, url, task_id)
     await asyncio.to_thread(ensure_index, False, [version_id])
     changed = "new" if not existing else "existing" if existing["content_hash"] == hashlib.sha256(content.encode()).hexdigest() else "updated"
     return source_result(document_id, version_id, url, change_type=changed, http_status=resource.status)
+
+
+def record_fetch_failure(document_id, error):
+    detail = f"HTTP {error.response.status_code}" if isinstance(error, httpx.HTTPStatusError) else type(error).__name__
+    db.execute("INSERT INTO document_fetch_failures(document_id,checked_at,error) VALUES(?,?,?) "
+               "ON CONFLICT(document_id) DO UPDATE SET checked_at=excluded.checked_at,error=excluded.error",
+               (document_id, db.now(), detail))
+
+
+def mark_unchanged(document_id):
+    with db.transaction() as connection:
+        connection.execute("UPDATE source_checks SET checked_at=? WHERE document_id=?", (db.now(), document_id))
+        connection.execute("DELETE FROM document_fetch_failures WHERE document_id=?", (document_id,))
 
 
 def archive_resource(resource, requested_url, task_id, publication=None, publisher=None, fallback_title=None):
@@ -437,6 +543,7 @@ def archive_resource(resource, requested_url, task_id, publication=None, publish
         connection.executemany("INSERT OR IGNORE INTO source_aliases(url,document_id) VALUES(?,?)", ((continuity.canonical_url(alias), document_id) for alias in {requested_url, resource.url}))
         connection.execute("INSERT OR IGNORE INTO source_snapshots(version_id,content_type,content_hash,body,headers_json,method,created_at) VALUES(?,?,?,?,?,'direct_http',?)", (version_id, content_type, hashlib.sha256(resource.body).hexdigest(), resource.body, station.encode(metadata), db.now()))
         connection.execute("INSERT INTO source_checks(document_id,version_id,checked_at,final_url,etag,last_modified) VALUES(?,?,?,?,?,?) ON CONFLICT(document_id) DO UPDATE SET version_id=excluded.version_id,checked_at=excluded.checked_at,final_url=excluded.final_url,etag=excluded.etag,last_modified=excluded.last_modified", (document_id, version_id, db.now(), resource.url, metadata.get("etag", ""), metadata.get("last-modified", "")))
+        connection.execute("DELETE FROM document_fetch_failures WHERE document_id=?", (document_id,))
         if publisher:
             connection.execute("UPDATE documents SET publisher=? WHERE id=? AND publisher=''", (publisher, document_id))
     return document_id, version_id, content
@@ -484,13 +591,13 @@ def put_knowledge(body, kind, claim_ids, task_id, conditions=None, topic_id=None
         connection.execute("INSERT OR IGNORE INTO knowledge_facets(item_id,facet_key,kind,conditions_json,topic_id,entity_id) VALUES(?,?,?,?,?,?)", (identifier, facet_key, kind, station.encode(conditions), topic_id, entity_id))
         for claim_id in set(claim_ids):
             connection.execute("INSERT OR IGNORE INTO knowledge_evidence(item_id,claim_id) VALUES(?,?)", (identifier, claim_id))
+        evidence = connection.execute("SELECT DISTINCT c.document_id,v.content_hash,c.verification FROM knowledge_evidence e "
+                                      "JOIN claims c ON c.id=e.claim_id LEFT JOIN document_versions v ON v.id=c.document_version_id "
+                                      "WHERE e.item_id=? ORDER BY c.document_id,v.content_hash,c.verification", (identifier,))
+        connection.execute("UPDATE knowledge_items SET evidence_hash=? WHERE id=?",
+                           (continuity.digest([tuple(row) for row in evidence]), identifier))
         continuity.record_change(connection, task_id, identifier, actual_change, reason)
     return identifier
-
-
-@lru_cache(maxsize=4)
-def knowledge_vectors(texts, name, device):
-    return embedding_model(name, device).encode(list(texts), normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=False)
 
 
 def related_knowledge(query, limit=20):
@@ -499,9 +606,8 @@ def related_knowledge(query, limit=20):
         return []
     config = options()
     with MODEL_LOCK:
-        vectors = knowledge_vectors(tuple(item["body"] for item in items), config.embedding_model, config.device)
-        vector = embedding_model(config.embedding_model, config.device).encode([query], normalize_embeddings=True, convert_to_numpy=True, show_progress_bar=False)[0]
-    scores = vectors @ vector
+        vector, *vectors = cached_embeddings([query, *(item["body"] for item in items)], config.embedding_model, config.device)
+    scores = np.asarray(vectors) @ vector
     order = np.argsort(-scores)[:limit]
     selected = [{**items[index], "similarity": float(scores[index])} for index in order]
     for item in selected:

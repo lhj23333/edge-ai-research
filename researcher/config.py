@@ -2,6 +2,7 @@ import fcntl
 import hashlib
 import json
 import os
+from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,22 +24,49 @@ PRESETS = {
 }
 
 Effort = Literal["low", "high", "max", "disabled", "default"]
-MODEL_STEPS = {
-    "prefilter": ("disabled", 512), "score": ("disabled", 1024),
-    "write": ("disabled", 1536), "cluster": ("disabled", 1024),
-    "cluster_review": ("low", 1024), "deep_plan": ("high", 8192),
-    "deep_review": ("high", 32768),
+CostProfile = Literal["eco", "balanced", "deep"]
+ModelTier = Literal["economy", "primary", "reasoning"]
+MODEL_STEPS = ("prefilter", "score", "cluster", "deep_plan", "deep_write", "deep_review")
+STEP_LABELS = dict(zip(MODEL_STEPS, ("条目预筛", "条目评分", "摘要与聚簇", "深研规划", "深研撰写", "深研审阅"), strict=True))
+MODEL_TIERS = {"economy": "廉价模型", "primary": "主力模型", "reasoning": "推理模型"}
+
+
+@dataclass(frozen=True)
+class CostPolicy:
+    label: str
+    web_pages: int
+    review_rounds: int
+    event_candidates: int
+    daily_topic_calls: int
+    polish_briefing: bool
+    slots: Mapping[str, tuple[ModelTier, Effort, int]]
+
+
+COST_PROFILES = {
+    "eco": CostPolicy("极省", 4, 1, 4, 8, False, dict(zip(MODEL_STEPS, (
+        ("economy", "disabled", 384), ("economy", "disabled", 512), ("economy", "disabled", 1536),
+        ("economy", "disabled", 2048), ("economy", "disabled", 4096), ("economy", "disabled", 4096),
+    ), strict=True))),
+    "balanced": CostPolicy("均衡", 10, 2, 8, 16, False, dict(zip(MODEL_STEPS, (
+        ("economy", "disabled", 512), ("economy", "disabled", 768), ("economy", "disabled", 1536),
+        ("primary", "low", 4096), ("primary", "disabled", 8192), ("primary", "low", 8192),
+    ), strict=True))),
+    "deep": CostPolicy("深度", 20, 3, 12, 24, True, dict(zip(MODEL_STEPS, (
+        ("economy", "disabled", 512), ("primary", "disabled", 1024), ("primary", "low", 2048),
+        ("reasoning", "high", 8192), ("primary", "low", 12288), ("reasoning", "high", 16384),
+    ), strict=True))),
 }
 
 
 class ModelRoute(BaseModel):
+    enabled: bool | None = None
     profile_id: str | None = None
     reasoning_effort: Effort | None = None
     output_tokens: int | None = Field(default=None, ge=128, le=32768)
 
 
 def model_routes(values):
-    if set(values) - MODEL_STEPS.keys():
+    if set(values) - set(MODEL_STEPS):
         raise ValueError("包含未知的模型步骤")
     return {name: ModelRoute.model_validate(values.get(name, {})).model_dump(exclude_none=True) for name in MODEL_STEPS}
 
@@ -48,9 +76,8 @@ class Limits(BaseModel):
     task_requests: int = Field(default=8, ge=2, le=100)
     output_tokens: int = Field(default=4096, ge=256, le=32768)
     timezone: str = "Asia/Shanghai"
-    minute_cost: float | None = Field(default=None, gt=0, allow_inf_nan=False)
-    hour_cost: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     daily_cost: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    monthly_cost: float | None = Field(default=None, gt=0, allow_inf_nan=False)
 
     @field_validator("timezone")
     @classmethod
@@ -82,12 +109,22 @@ class ResearchSettings(BaseModel):
     device: str = Field(default="cuda:0", pattern=r"^(cpu|cuda:[0-9]+)$")
     embedding_model: str = "BAAI/bge-m3"
     reranker_model: str = "BAAI/bge-reranker-v2-m3"
-    planning_effort: Literal["low", "high", "max", "disabled"] = "high"
-    review_effort: Literal["low", "high", "max", "disabled"] = "high"
-    synthesis_effort: Literal["low", "high", "max", "disabled"] = "disabled"
-    planning_output_tokens: int = Field(default=8192, ge=1024, le=32768)
-    review_output_tokens: int = Field(default=32768, ge=1024, le=32768)
-    synthesis_output_tokens: int = Field(default=8192, ge=1024, le=32768)
+
+
+LEGACY_RESEARCH_PARAMETERS = {
+    "planning_effort": "high", "planning_output_tokens": 8192,
+    "review_effort": "high", "review_output_tokens": 32768,
+    "synthesis_effort": "disabled", "synthesis_output_tokens": 8192,
+}
+
+
+def legacy_research_parameters(config):
+    return {**LEGACY_RESEARCH_PARAMETERS, **config["legacy_research"]}
+
+
+class CostSettings(BaseModel):
+    cost_profile: CostProfile = "balanced"
+    briefing_polish: bool | None = None
 
 
 class Profile(BaseModel):
@@ -96,6 +133,7 @@ class Profile(BaseModel):
     provider: str
     base_url: HttpUrl
     model: str = Field(min_length=1, max_length=120)
+    tier: ModelTier = "primary"
     reasoning_effort: Effort = "low"
     input_price: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     output_price: float | None = Field(default=None, ge=0, allow_inf_nan=False)
@@ -151,6 +189,16 @@ def write_json(name, value):
     path.chmod(0o600)
 
 
+def stored_routes(routes):
+    routes = {} if routes is None else routes
+    migrated = {step: routes[step] if routes.get(step) is not None else {} for step in MODEL_STEPS}
+    if not migrated["cluster"]:
+        migrated["cluster"] = routes.get("write") or routes.get("cluster_review") or {}
+    if "deep_write" not in routes and routes.get("deep_plan"):
+        migrated["deep_write"] = routes["deep_plan"]
+    return model_routes(migrated)
+
+
 def settings():
     data = read_json("config.json", {})
     items = []
@@ -160,7 +208,12 @@ def settings():
             profile.chat_verified = None
             profile.search_verified = None
         items.append(profile.model_dump(mode="json"))
-    return {"profiles": items, "active_profile": data.get("active_profile", ""), "limits": Limits(**data.get("limits", {})).model_dump(), "research": ResearchSettings(**data.get("research", {})).model_dump(), "model_routes": model_routes(data.get("model_routes", {}))}
+    research = data.get("research", {})
+    old_parameters = {**research, **data.get("legacy_research", {})}
+    return {**CostSettings.model_validate(data).model_dump(), "profiles": items, "active_profile": data.get("active_profile", ""),
+            "limits": Limits(**data.get("limits", {})).model_dump(), "research": ResearchSettings(**research).model_dump(),
+            "model_routes": stored_routes(data.get("model_routes", {})),
+            "legacy_research": {key: old_parameters[key] for key in LEGACY_RESEARCH_PARAMETERS if key in old_parameters}}
 
 
 def get_profile(profile_id=None, config=None):
@@ -180,27 +233,28 @@ class EffectiveRoute:
     output_tokens: int
 
 
-def resolve_route(step, *, config=None, profile_id=None, synthesis=False):
+def resolve_route(step, *, config=None):
     config = config if config is not None else settings()
-    # 恢复深研时沿用已保存的模型和请求参数。
-    route = {} if profile_id else config["model_routes"][step]
-    effort, tokens = MODEL_STEPS[step]
-    if step in {"deep_plan", "deep_review"}:
-        prefix = "synthesis" if synthesis else "planning" if step == "deep_plan" else "review"
-        effort = config["research"][prefix + "_effort"]
-        tokens = config["research"][prefix + "_output_tokens"]
-    return EffectiveRoute(step, get_profile(route.get("profile_id") or profile_id, config),
+    route = config["model_routes"][step]
+    if route.get("enabled") is False:
+        route = {}
+    tier, effort, tokens = COST_PROFILES[config["cost_profile"]].slots[step]
+    selected = route.get("profile_id")
+    if not selected:
+        compatible = [item for item in config["profiles"] if item["chat_verified"]
+                      and (step not in {"deep_plan", "deep_review"} or item["provider"] not in {"qwen", "volcengine"})]
+        eligible = [item for item in compatible if item.get("tier", "primary") == tier]
+        if not eligible and step.startswith("deep_"):
+            eligible = compatible
+        if eligible and all(item["id"] != config["active_profile"] for item in eligible):
+            selected = eligible[0]["id"]
+    return EffectiveRoute(step, get_profile(selected, config),
                           route.get("reasoning_effort", effort), route.get("output_tokens", tokens))
 
 
 def describe_routes(config):
-    for step, (effort, tokens) in MODEL_STEPS.items():
-        values = config["model_routes"][step]
-        if step in {"deep_plan", "deep_review"}:
-            prefix = "planning" if step == "deep_plan" else "review"
-            effort = config["research"][prefix + "_effort"]
-            tokens = config["research"][prefix + "_output_tokens"]
-        yield {"step": step, "values": values, "effort": effort, "tokens": tokens}
+    for step, (tier, effort, tokens) in COST_PROFILES[config["cost_profile"]].slots.items():
+        yield {"step": step, "values": config["model_routes"][step], "tier": MODEL_TIERS[tier], "effort": effort, "tokens": tokens}
 
 
 def secret(profile_id):
@@ -215,12 +269,9 @@ def fingerprint(profile):
     return hashlib.sha256(json.dumps(values).encode()).hexdigest()
 
 
-def research_routes(config=None, profile_id=None):
+def research_routes(config=None):
     config = config if config is not None else settings()
-    plan = resolve_route("deep_plan", config=config, profile_id=profile_id)
-    review = resolve_route("deep_review", config=config, profile_id=profile_id)
-    write = resolve_route("deep_plan", config=config, profile_id=profile_id, synthesis=True)
-    return plan, review, write
+    return tuple(resolve_route(step, config=config) for step in ("deep_plan", "deep_review", "deep_write"))
 
 
 def routes_fingerprint(routes):

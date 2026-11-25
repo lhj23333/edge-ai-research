@@ -25,6 +25,9 @@ async def perform(task):
     elif task["kind"] == "selectbench":
         from .ingest.benchmark import perform as perform_benchmark
         await perform_benchmark(task)
+    elif task["kind"] == "briefing":
+        from .ingest.briefing import perform as perform_briefing
+        await perform_briefing(task)
     elif task["kind"] in {"test_chat", "test_search", "test_tools"}:
         await test_connection(task)
     else:
@@ -121,6 +124,9 @@ async def run_task(task):
         if task["kind"] == "question":
             db.execute("UPDATE research_questions SET status='failed',updated_at=? WHERE task_id=?", (db.now(), task["id"]))
     finally:
+        if task["automatic"] and (task["schedule_key"] or "").startswith("topic-revision:"):
+            db.execute("UPDATE topic_retry_quotas SET status='finished' WHERE task_id=? AND status='active' "
+                       "AND EXISTS(SELECT 1 FROM tasks WHERE id=? AND status NOT IN ('queued','running'))", (task["id"], task["id"]))
         if task.get("session_id"):
             current = db.one("SELECT status FROM tasks WHERE id=?", (task["id"],))
             if current and current["status"] in {"failed", "cancelled", "interrupted"}:
@@ -160,6 +166,8 @@ async def loop():
             finish_gap(task, False)
     db.execute("UPDATE feed_runs SET status='interrupted',error='采集已中断',finished_at=? WHERE status='running' AND task_id IN (SELECT id FROM tasks WHERE status='interrupted')", (db.now(),))
     db.execute("UPDATE usage SET status='interrupted' WHERE status='reserved'")
+    db.execute("UPDATE topic_retry_quotas SET status='finished' WHERE status='active' AND task_id IN "
+               "(SELECT id FROM tasks WHERE status NOT IN ('queued','running'))")
     pulse = asyncio.create_task(heartbeat())
     stop = asyncio.Event()
     running = {True: None, False: None}

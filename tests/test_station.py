@@ -147,6 +147,52 @@ def test_comparison_excludes_non_products_archived_and_missing_ids(client):
     assert "一次最多选择三款产品" not in response.text
 
 
+def test_product_aliases_merge_evidence_and_count_as_one_comparison_slot(client, csrf):
+    nxp = station.entity("厂商", "NXP Semiconductors")
+    ara = station.entity("产品", "Ara240", parent_id=nxp)
+    assert station.entity("产品", "Ara240 DNPU", parent_id=nxp) == ara
+    dupe = station.entity("产品", "Ara240 独立神经处理单元", parent_id=nxp)
+    hailo = station.entity("厂商", "Hailo")
+    older = station.entity("产品", "Hailo-8", parent_id=hailo)
+    newer = station.entity("产品", "Hailo-10H", parent_id=hailo)
+    assert station.entity("产品", "Hailo 10H", parent_id=hailo) == newer != older
+    deepx = station.entity("厂商", "DEEPX")
+    dx_m1 = station.entity("产品", "DX-M1", parent_id=deepx)
+    assert station.entity("产品", "DX M1 Chip", parent_id=deepx) == dx_m1
+    assert station.entity("产品", "DX-M2", parent_id=deepx) != dx_m1
+    assert "代号不同" in client.post(f"/entities/{older}/merge", data={"csrf": csrf, "target_id": newer}).text
+    assert "归属厂商不同" in client.post(f"/entities/{newer}/merge", data={"csrf": csrf, "target_id": ara}).text
+    url = "https://www.eepw.com.cn/article/202610/484309.htm"
+    statement = "贸泽电子即日起开售NXP Semiconductors的全新Ara240独立神经处理单元。"
+    document, version = station.save_document(Source("贸泽开售 NXP Ara240", url, statement, "公开资料"), None)
+    claim = station.save_claim(document, version, statement, statement, "公开披露")
+    claim_alias = station.save_claim(document, version, "Ara240 是独立神经处理单元。", statement, "公开披露")
+    with db.transaction() as connection:
+        for identifier, claim_id in ((ara, claim), (dupe, claim_alias)):
+            connection.execute("INSERT INTO entity_fields(entity_id,field_name,value,claim_id,updated_at) VALUES(?,'业务定位','独立神经处理单元',?,?)",
+                               (identifier, claim_id, db.now()))
+            connection.execute("INSERT INTO relations(from_entity_id,to_entity_id,relation_type,explanation,claim_id,created_at) "
+                               "VALUES(?,?,'提供产品',?,?,?)", (nxp, identifier, statement, claim_id, db.now()))
+    event, _ = station.add_event({"identity_key": "nxp-ara240-availability", "event_type": "产品发布", "title": "NXP Ara240 上市",
+                                  "what_happened": statement, "why_important": "新增可购买的部署候选。"}, [claim], [dupe, ara], [])
+    assert "归并重复产品" in client.get(f"/entities/{dupe}").text
+    response = client.post(f"/entities/{dupe}/merge", data={"csrf": csrf, "target_id": ara}, follow_redirects=False)
+    assert response.headers["location"].startswith(f"/entities/{ara}?")
+    assert client.get(f"/entities/{dupe}", follow_redirects=False).headers["location"].startswith(f"/entities/{ara}?")
+    assert station.entity("产品", "Ara240 独立神经处理单元") == ara
+    assert db.query("SELECT entity_id,feed_only FROM event_entities WHERE event_id=?", (event,)) == [{"entity_id": ara, "feed_only": 0}]
+    assert db.query("SELECT entity_id FROM entity_fields") == [{"entity_id": ara}]
+    assert db.query("SELECT to_entity_id FROM relations") == [{"to_entity_id": ara}]
+    assert db.query("SELECT entity_id,claim_id FROM entity_claims") == [{"entity_id": ara, "claim_id": claim_alias}]
+    view = client.get(f"/entities/{ara}")
+    assert "Ara240 DNPU" in view.text and "归并保留的证据" in view.text
+    assert f'/documents/{document}?version={version}' in view.text
+    result = client.get("/compare", params=[("id", identifier) for identifier in (ara, dupe, ara, older, newer)])
+    assert {item["id"] for item in result.context["selected"]} == {ara, older, newer}
+    assert "已选择 3 / 3" in result.text and "一次最多选择三款产品" not in result.text
+    assert not html.fromstring(result.content).xpath(f"//input[@name='id'][@value='{dupe}']")
+
+
 @pytest.mark.parametrize(("first", "second", "comparable"), [
     ("典型", "典型", False),
     ("模型 ResNet-50；INT8；批量 1；设备 Raspberry Pi 5", "模型 ResNet-50；INT8；批量 1；设备 Raspberry Pi 5", False),

@@ -1,15 +1,20 @@
 import asyncio
 import secrets
+from datetime import datetime, timedelta, timezone
+from urllib.parse import unquote, urlsplit
 
+import httpx
 import pytest
+from lxml import html
 
-from researcher import continuity, db, research, station
-from researcher.config import Profile, ResearchSettings, save_profile, settings, write_json
+from researcher import continuity, db, knowledge, research, station
+from researcher.config import COST_PROFILES, Profile, ResearchSettings, save_profile, settings, write_json
 from researcher.knowledge import public_url
-from researcher.providers import ResearchError
-from researcher.research_engine import ResearchRun
-from researcher.research_models import Gap, LEGACY_PROMPT_VERSION
-from researcher.scheduler import tick
+from researcher.providers import BudgetExceeded, ResearchError, Source
+from researcher.research_engine import ResearchRun, perform, route_review
+from researcher.research_models import Draft, Finding, FindingReview, Gap, LEGACY_PROMPT_VERSION, Point, PointReview, Review
+from researcher.research_review import partial_review
+from researcher.scheduler import release_expired, schedule_directed_research, tick
 from researcher.worker import claim_task
 
 
@@ -39,6 +44,405 @@ def test_empty_research_session_and_evidence_are_not_created(client, csrf):
     assert client.post("/research/999999/messages", data={"csrf": csrf, "message": "继续检查原文"}).status_code == 404
     assert db.one("SELECT count(*) AS n FROM claim_evidence")["n"] == 0
     assert db.one("SELECT count(*) AS n FROM knowledge_items")["n"] == 0
+
+
+def test_research_routes_accept_requests_with_a_tight_safety_limit(client, csrf):
+    profile = Profile(id="glm", name="智谱", provider="zhipu", model="GLM-5.2", base_url="https://open.bigmodel.cn/api/paas/v4",
+                      chat_verified=db.now(), input_price=8, output_price=28)
+    save_profile(profile, secrets.token_urlsafe())
+    payload = {"csrf": csrf, "message": "核对 Hailo-10H 的公开部署条件"}
+    allowed = client.post("/research", data=payload, follow_redirects=False)
+    session_path = allowed.headers["location"]
+    task = db.one("SELECT id FROM tasks")["id"]
+    client.post(f"/tasks/{task}/cancel", data={"csrf": csrf}, follow_redirects=False)
+    source = Source("Hailo-10H", "https://hailo.ai/products/ai-accelerators/hailo-10h-ai-accelerator/",
+                    "Hailo-10H supports edge generative AI applications.", "公开资料")
+    document, version = station.save_document(source, None)
+    claim = station.save_claim(document, version, source.content, source.content, "厂商宣称")
+    event, _ = station.add_event({"identity_key": "hailo-10h-availability", "event_type": "产品发布", "title": source.title,
+                                  "what_happened": source.content, "why_important": "支持边缘生成式推理。"}, [claim], [], [])
+    config = settings()
+    config["limits"]["daily_cost"] = 0.000001
+    write_json("config.json", config)
+    for path in ("/research", session_path + "/messages", f"/events/{event}/research"):
+        result = client.post(path, data={**payload, "force_refresh": "yes"}, follow_redirects=False)
+        assert result.status_code == 303 and not urlsplit(result.headers["location"]).query
+        assert result.headers["location"].startswith("/research/")
+    assert db.one("SELECT count(*) AS n FROM tasks WHERE status='queued'")["n"] == 3
+
+
+def cost_profile_for_research(name="balanced", limit=None):
+    profile = Profile(id="glm", name="智谱", provider="zhipu", model="GLM-5.2", base_url="https://open.bigmodel.cn/api/paas/v4",
+                      chat_verified=db.now(), input_price=8, output_price=28)
+    save_profile(profile, secrets.token_urlsafe())
+    config = settings()
+    config.update(cost_profile=name)
+    config["research"]["device"] = "cpu"
+    config["limits"]["daily_cost"] = limit
+    write_json("config.json", config)
+
+
+def archived_hailo():
+    source = Source("Hailo-10H", "https://hailo.ai/products/ai-accelerators/hailo-10h-ai-accelerator/",
+                    "Hailo-10H supports edge generative AI applications in a standard M.2 form factor.", "公开资料")
+    document, version = station.save_document(source, None)
+    with db.transaction() as connection:
+        station.save_document_chunk(connection, version, 0, 0, None, source.title, source.content)
+    chunk = db.one("SELECT id FROM document_chunks WHERE version_id=?", (version,))["id"]
+    return source, document, version, {**knowledge.chunk_row(chunk), "chunk_id": chunk}
+
+
+@pytest.fixture
+def targeted_hailo(topic):
+    source, document, version, chunk = archived_hailo()
+    claim = station.save_claim(document, version, source.content, source.content, "厂商宣称")
+    event, _ = station.add_event({"identity_key": "hailo-10h-availability", "event_type": "产品发布", "title": source.title,
+                                  "what_happened": source.content, "why_important": "支持边缘生成式推理。"}, [claim], [], [topic["id"]])
+
+    def enqueue(target_kind, *, automatic=False):
+        if target_kind == "event":
+            return research.enqueue_event(event, automatic=automatic)
+        return research.enqueue("revise", research.topic_job(topic))
+
+    return source, document, version, chunk, claim, enqueue
+
+
+def hailo_review_state(chunk):
+    statement = chunk["content"]
+    reason = "产品资料直接说明了该形态。"
+    draft = Draft(findings=[Finding(ref="hailo", statement=statement, label="厂商宣称", chunk_ids=[chunk["chunk_id"]])],
+                  points=[Point(category="来源陈述", text=statement, finding_refs=["hailo"])], complete=True, completion_notes=reason)
+    review = Review(findings=[FindingReview(ref="hailo", verdict="supported", reason=reason)],
+                    points=[PointReview(index=0, verdict="supported", reason=reason)], completion_satisfied=True)
+    return {"draft": draft.model_dump(), "review": review.model_dump(), "chunks": [chunk], "finish": {}, "errors": [], "round": 1}
+
+
+def assert_research_restarts_at_planning(task, expected_reason="cost_safety_limit"):
+    config = settings()
+    config["research"]["device"] = "cpu"
+    config["limits"]["daily_cost"] = 0.000001
+    write_json("config.json", config)
+    asyncio.run(perform(task))
+    result = station.decode(db.one("SELECT result_json FROM tasks WHERE id=?", (task["id"],))["result_json"])
+    assert result.get("skipped_reason") is None
+    assert result["degraded_reason"] == expected_reason
+    assert db.one("SELECT stage FROM task_steps WHERE task_id=? AND stage='研究目标与已有知识'", (task["id"],))
+    assert db.one("SELECT status FROM research_operations WHERE task_id=? AND kind='plan'", (task["id"],)) == {"status": "blocked"}
+    assert not db.one("SELECT id FROM usage WHERE task_id=?", (task["id"],))
+    return result
+
+
+def test_redline_keeps_latest_draft_and_unverified_claims_stay_out_of_knowledge():
+    cost_profile_for_research(limit=0.000001)
+    source, _, _, chunk = archived_hailo()
+    task_id = research.enqueue("interactive", {"main_question": "核查 Hailo-10H 的部署形态"})
+    task = claim_task(True)
+    assert task["id"] == task_id
+    run = ResearchRun(task)
+    draft = Draft(findings=[Finding(ref="hailo", statement=source.content, label="厂商宣称", chunk_ids=[chunk["chunk_id"]])],
+                  points=[Point(category="来源陈述", text=source.content, finding_refs=["hailo"])],
+                  complete=False, completion_notes="已有产品说明，仍需核验部署条件。")
+    state = {"draft": draft.model_dump(), "chunks": [chunk], "errors": [], "finish": {}, "round": 1}
+    state.update(asyncio.run(run.review(state)))
+    assert route_review(state) == "commit"
+    result = asyncio.run(run.commit(state))["outcome"]
+    assert result["degraded_reason"] == "cost_safety_limit"
+    assert result["draft"] == draft.model_dump() and source.content in result["answer"]
+    assert db.one("SELECT status FROM tasks WHERE id=?", (task_id,))["status"] == "success"
+    assert not db.query("SELECT id FROM knowledge_items")
+    assert not db.query("SELECT id FROM model_call_ledger")
+
+
+def test_redline_before_planning_finishes_the_graph_without_model_calls():
+    cost_profile_for_research(limit=0.000001)
+    task_id = research.enqueue("interactive", {"main_question": "核查 Hailo-10H 的部署形态"})
+    asyncio.run(perform(claim_task(True)))
+    task = db.one("SELECT status,result_json FROM tasks WHERE id=?", (task_id,))
+    assert task["status"] == "success"
+    assert station.decode(task["result_json"])["degraded_reason"] == "cost_safety_limit"
+    assert not db.query("SELECT id FROM model_call_ledger")
+
+
+@pytest.mark.parametrize("name", ["eco", "balanced", "deep"])
+def test_review_round_limit_commits_the_current_draft(name):
+    cost_profile_for_research(name)
+    task_id = research.enqueue("interactive", {"main_question": "核查 Hailo-10H 的部署形态"})
+    run = ResearchRun(claim_task(True))
+    assert run.task["id"] == task_id
+    source, _, _, chunk = archived_hailo()
+    draft = Draft(findings=[Finding(ref="hailo", statement=source.content, label="厂商宣称", chunk_ids=[chunk["chunk_id"]])],
+                  complete=False, completion_notes="已有产品说明，仍需核验部署条件。")
+    state = {"draft": draft.model_dump(), "review_round": COST_PROFILES[name].review_rounds - 1,
+             "chunks": [chunk], "finish": {}, "errors": [], "round": 1}
+    reviewed = partial_review(draft, "需要更多公开部署资料").model_dump()
+    state.update(run.review_outcome(state, {"review": reviewed}))
+    assert route_review(state) == "commit"
+    result = asyncio.run(run.commit(state))["outcome"]
+    assert result["degraded_reason"] == "review_round_limit"
+    assert result["draft"] == draft.model_dump()
+    assert result["review_rounds"] == COST_PROFILES[name].review_rounds
+
+
+@pytest.mark.parametrize("target_kind", ["topic", "event"])
+def test_unchanged_evidence_reuses_research_and_new_source_version_invalidates_it(targeted_hailo, target_kind):
+    cost_profile_for_research()
+    source, _, version, chunk, _, enqueue = targeted_hailo
+    first = enqueue(target_kind)
+    run = ResearchRun(claim_task(True))
+    assert run.unchanged_evidence() is None
+    hash_before = run.evidence_hash
+    draft = Draft(complete=False, completion_notes="当前只保存已归档的资料")
+    state = {"draft": draft.model_dump(), "review": partial_review(draft, "当前只保存已归档的资料").model_dump(),
+             "chunks": [chunk], "finish": {}, "errors": [], "round": 0}
+    assert asyncio.run(run.commit(state))["outcome"]["evidence_hash"] == hash_before
+
+    automatic = target_kind == "event"
+    second = enqueue(target_kind, automatic=automatic)
+    asyncio.run(perform(claim_task(not automatic)))
+    result = station.decode(db.one("SELECT result_json FROM tasks WHERE id=?", (second,))["result_json"])
+    assert result["evidence_hash"] == hash_before
+    assert result["reused_task_id"] == first and result["skipped_reason"] == "evidence_unchanged"
+    assert not db.query("SELECT id FROM model_call_ledger")
+    if automatic:
+        assert enqueue(target_kind, automatic=True) == second
+
+    updated = Source(source.title, source.url, source.content + "\nHailo-10H supports vision language models.", source.extent)
+    assert station.save_document(updated, None)[1] != version
+    third = enqueue(target_kind, automatic=automatic)
+    current = ResearchRun(claim_task(not automatic))
+    assert current.task["id"] == third and current.unchanged_evidence() is None
+    assert current.evidence_hash != hash_before
+
+
+def test_topic_cache_tracks_recalled_unlinked_archive_versions(topic, targeted_hailo):
+    cost_profile_for_research()
+    config = settings()
+    config["research"]["context_chunks"] = 4
+    write_json("config.json", config)
+    _, linked_document, _, chunk, _, _ = targeted_hailo
+    goal = "Hailo-10H edge AI accelerator M.2 module deployment and hardware specifications"
+    job = {**research.topic_job(topic), "main_question": goal}
+    materials = (
+        ("software", "The Hailo-10H edge AI accelerator runs generative AI models with the Hailo software suite."),
+        ("form-factor", "Hailo-10H M.2 modules are designed for edge AI accelerator deployments."),
+        ("hardware", "Hailo-10H offloads neural network inference from the host processor in edge AI systems."),
+    )
+    for name, text in materials:
+        station.save_document(Source("Hailo-10H " + name, f"https://hailo.ai/{name}", text, "文本原文"), None)
+
+    original_id = research.enqueue("revise", job)
+    original = ResearchRun(claim_task(True))
+    assert original.unchanged_evidence() is None
+    assert linked_document in {item["document_id"] for item in original.topic_archive}
+    asyncio.run(original.commit(hailo_review_state(chunk)))
+    original_hash = original.evidence_hash
+
+    unrelated, _ = station.save_document(Source("Bananas", "https://www.rhs.org.uk/plants/banana",
+                                               "Bananas ripen as the fruit releases ethylene gas. A paper bag keeps the gas around the fruit.", "文本原文"), None)
+    assert unrelated not in {item["document_id"] for item in knowledge.search(goal)}
+    reuse_id = research.enqueue("revise", job)
+    asyncio.run(perform(claim_task(True)))
+    reused = station.decode(db.one("SELECT result_json FROM tasks WHERE id=?", (reuse_id,))["result_json"])
+    assert reused["skipped_reason"] == "evidence_unchanged" and reused["reused_task_id"] == original_id
+    assert reused["evidence_hash"] == original_hash
+
+    related, version = station.save_document(Source("Hailo-10H edge AI accelerator M.2 module specifications",
+                                                    "https://hailo.ai/products/ai-accelerators/hailo-10h-m-2-module/",
+                                                    "The Hailo-10H edge AI accelerator is available as an M.2 module. Its deployment uses a host with a compatible M.2 slot.",
+                                                    "文本原文"), None)
+    assert not db.one("SELECT id FROM claims WHERE document_id=?", (related,))
+    assert (related, version) in {(item["document_id"], item["version_id"]) for item in knowledge.search(goal)}
+    rerun_id = research.enqueue("revise", job)
+    task = claim_task(True)
+    assert task["id"] == rerun_id
+    rerun = ResearchRun(task)
+    assert rerun.unchanged_evidence() is None
+    state = asyncio.run(rerun.recall({}))
+    assert state["archive_evidence_hash"] == rerun.evidence_hash
+    synthesized = asyncio.run(rerun.synthesis_inputs(state))
+    assert (related, version) in {(item["document_id"], item["version_id"]) for item in synthesized["chunks"]}
+    result = assert_research_restarts_at_planning(task)
+    assert result["evidence_hash"] != original_hash
+    assert related in result["inspected_document_ids"] and unrelated not in result["inspected_document_ids"]
+    recalled = db.one("SELECT outputs_json FROM task_steps WHERE task_id=? AND stage='研究目标与已有知识'", (rerun_id,))
+    assert version in {knowledge.chunk_row(identifier)["version_id"] for identifier in station.decode(recalled["outputs_json"])["chunk_ids"]}
+
+
+@pytest.mark.parametrize(("target_kind", "feedback_kind"), [("topic", "incorrect"), ("event", "outdated")])
+def test_feedback_invalidates_evidence_cache_without_document_changes(targeted_hailo, target_kind, feedback_kind):
+    cost_profile_for_research()
+    _, _, _, chunk, _, enqueue = targeted_hailo
+    original_id = enqueue(target_kind)
+    original = ResearchRun(claim_task(True))
+    assert original.unchanged_evidence() is None
+    result = asyncio.run(original.commit(hailo_review_state(chunk)))["outcome"]
+    assert result["complete"]
+    item_id, = result["knowledge_ids"]
+
+    other_kind = "event" if target_kind == "topic" else "topic"
+    other_id = enqueue(other_kind)
+    other = ResearchRun(claim_task(True))
+    assert other.unchanged_evidence() is None
+    assert asyncio.run(other.commit(hailo_review_state(chunk)))["outcome"]["knowledge_ids"] == [item_id]
+    assert {row["task_id"] for row in db.query("SELECT task_id FROM research_evidence_versions")} == {original_id, other_id}
+
+    reused_id = enqueue(target_kind)
+    reused_task = claim_task(True)
+    assert reused_task["id"] == reused_id
+    asyncio.run(perform(reused_task))
+    reused = station.decode(db.one("SELECT result_json FROM tasks WHERE id=?", (reused_id,))["result_json"])
+    assert reused["skipped_reason"] == "evidence_unchanged" and reused["reused_task_id"] == original_id
+
+    research.feedback(reused_task["session_id"], reused_id, feedback_kind, "请核对模块适用的版本", item_id)
+    assert continuity.canonical_knowledge(item_id)["status"] == "needs_review"
+    assert not db.query("SELECT task_id FROM research_evidence_versions")
+    with db.open_database() as connection:
+        assert original.current_evidence_hash(connection) == original.evidence_hash
+
+    rerun_id = enqueue(target_kind)
+    rerun_task = claim_task(True)
+    assert rerun_task["id"] == rerun_id
+    assert_research_restarts_at_planning(rerun_task)
+
+
+def test_existing_evidence_cache_rechecks_invalidated_knowledge_on_read_and_write(targeted_hailo):
+    cost_profile_for_research()
+    _, _, _, chunk, claim, enqueue = targeted_hailo
+    original_id = enqueue("topic")
+    original = ResearchRun(claim_task(True))
+    assert original.unchanged_evidence() is None
+    state = hailo_review_state(chunk)
+    prior = asyncio.run(original.commit(state))["outcome"]
+    item_id, = prior["knowledge_ids"]
+
+    rerun_id = enqueue("topic")
+    rerun = ResearchRun(claim_task(True))
+    cached = rerun.unchanged_evidence()
+    assert cached["reused_task_id"] == original_id
+    knowledge.put_knowledge("Hailo-10H 的 M.2 模块适用条件应以产品说明为准。", "事实", [claim], None,
+                            existing_id=item_id, change_type="updated")
+    assert continuity.canonical_knowledge(item_id)["status"] == "needs_review"
+    assert db.one("SELECT task_id FROM research_evidence_versions") == {"task_id": original_id}
+    assert rerun.unchanged_evidence() is None
+    assert not rerun.finish_result(cached, cached["answer"], verify_cached_evidence=True)
+    assert db.one("SELECT status FROM tasks WHERE id=?", (rerun_id,)) == {"status": "running"}
+
+    rerun_result = asyncio.run(rerun.commit(state))["outcome"]
+    assert rerun_result["knowledge_ids"] == [item_id]
+    assert db.one("SELECT task_id FROM research_evidence_versions") == {"task_id": original_id}
+
+
+@pytest.mark.parametrize("change", ["preset", "model_slot"])
+def test_degraded_evidence_cache_uses_effective_policy_and_model_routes(targeted_hailo, change):
+    _, _, _, chunk, _, enqueue = targeted_hailo
+    cost_profile_for_research("eco")
+    config = settings()
+    for step in ("deep_plan", "deep_review", "deep_write"):
+        _, effort, tokens = COST_PROFILES["eco"].slots[step]
+        config["model_routes"][step] = {"profile_id": "glm", "reasoning_effort": effort, "output_tokens": tokens}
+    write_json("config.json", config)
+    original_id = enqueue("topic")
+    original = ResearchRun(claim_task(True))
+    assert original.unchanged_evidence() is None
+    state = hailo_review_state(chunk)
+    draft = Draft.model_validate(state["draft"])
+    reviewed = partial_review(draft, "需要核实不同部署形态的适用条件。")
+    outcome = original.review_outcome(state, {"review": reviewed.model_dump()})
+    result = asyncio.run(original.commit({**state, **outcome}))["outcome"]
+    assert result["degraded_reason"] == "review_round_limit" and result["review_rounds"] == 1
+    assert db.one("SELECT task_id FROM research_evidence_versions") == {"task_id": original_id}
+
+    same = enqueue("topic")
+    asyncio.run(perform(claim_task(True)))
+    reused = station.decode(db.one("SELECT result_json FROM tasks WHERE id=?", (same,))["result_json"])
+    assert reused["skipped_reason"] == "evidence_unchanged" and reused["reused_task_id"] == original_id
+
+    if change == "preset":
+        config["cost_profile"] = "deep"
+    else:
+        profile = Profile(id="deepseek", name="DeepSeek", provider="deepseek", model="deepseek-chat",
+                          chat_verified=db.now(), base_url="https://api.deepseek.com/v1")
+        save_profile(profile, secrets.token_urlsafe())
+        config = settings()
+        config["model_routes"]["deep_plan"]["profile_id"] = profile.id
+    write_json("config.json", config)
+    next_id = enqueue("topic")
+    next_task = claim_task(True)
+    assert next_task["id"] == next_id
+    rerun = ResearchRun(next_task)
+    assert rerun.evidence_request() != original.evidence_request()
+    assert rerun.unchanged_evidence() is None and rerun.evidence_hash == original.evidence_hash
+    if change == "preset":
+        assert rerun.routes_fingerprint == original.routes_fingerprint
+        assert rerun.remaining_pages() == COST_PROFILES["deep"].web_pages
+        updated = rerun.review_outcome(state, {"review": reviewed.model_dump()})
+        assert updated["review_round"] == 1 and route_review(updated) == "synthesize"
+        assert_research_restarts_at_planning(next_task)
+    else:
+        assert rerun.cost_profile == "eco" and rerun.routes_fingerprint != original.routes_fingerprint
+        assert rerun.gateway.route.profile.id == profile.id
+        rerun_result = assert_research_restarts_at_planning(next_task, "pricing_unavailable")
+        assert f"{profile.model}（deep_plan）" in rerun_result["degraded_detail"]
+
+
+def test_topic_schedule_quota_keeps_attempts_after_timeout(topic):
+    cost_profile_for_research("eco")
+    now = datetime.now(timezone.utc)
+    checked = now.isoformat(timespec="seconds")
+    due = (now - timedelta(minutes=1)).isoformat(timespec="seconds")
+    db.execute("UPDATE station_settings SET auto_enabled=1,watchlist_confirmed=1,sources_confirmed=1 WHERE id=1")
+    db.execute("INSERT INTO topic_research_schedules(topic_id,frequency,schedule_time,weekday,next_run) VALUES(?,'daily','09:00',0,?)",
+               (topic["id"], due))
+    schedule_directed_research()
+    task = claim_task(False)
+    gateway = ResearchRun(task).gateway
+    payload = {"messages": [{"role": "user", "content": topic["question"]}], "max_tokens": 128}
+    for _ in range(COST_PROFILES["eco"].daily_topic_calls):
+        gateway.reserve("plan", gateway.request_cost(payload, "plan"), tokens=gateway.request_tokens(payload, "plan"))
+    with pytest.raises(BudgetExceeded, match="定时专题研究"):
+        gateway.reserve("plan", gateway.request_cost(payload, "plan"))
+    db.execute("UPDATE tasks SET status='queued' WHERE id=?", (task["id"],))
+    db.execute("UPDATE topic_retry_quotas SET auto_released_at=? WHERE task_id=?", (due, task["id"]))
+    release_expired(checked)
+    quota = db.one("SELECT attempt_count,status FROM topic_retry_quotas WHERE task_id=?", (task["id"],))
+    assert quota == {"attempt_count": 8, "status": "expired"}
+    assert db.one("SELECT status FROM tasks WHERE id=?", (task["id"],))["status"] == "interrupted"
+    assert db.one("SELECT max(attempt_count) AS attempts FROM model_call_ledger WHERE task_id=?", (task["id"],))["attempts"] == 8
+
+
+def test_session_feedback_remains_visible_with_archived_citations(client, csrf, served_folder):
+    profile = Profile(id="glm", name="智谱", provider="zhipu", model="GLM-5.2", base_url="https://open.bigmodel.cn/api/paas/v4",
+                      chat_verified=db.now())
+    save_profile(profile, secrets.token_urlsafe())
+    task_id = research.enqueue("interactive", {"main_question": "核验 Hailo-10H 的部署形态"})
+    task = db.one("SELECT session_id FROM tasks WHERE id=?", (task_id,))
+    path = f"/research/{task['session_id']}"
+    statement = "Hailo-10H is available in a standard M.2 form factor."
+    url = served_folder + "/hailo-10h.txt"
+    source = Source("Hailo-10H", url, statement, "用户提供摘录")
+    document, version = station.save_document(source, task_id)
+    claim = station.save_claim(document, version, statement, statement, "厂商宣称", manual_excerpt=True)
+    chunk = db.one("SELECT id FROM document_chunks WHERE version_id=?", (version,))["id"]
+    item = knowledge.put_knowledge(statement, "事实", [claim], task_id)
+    db.execute("UPDATE tasks SET status='success',result_json=? WHERE id=?",
+               (station.encode({"knowledge_ids": [item], "document_ids": [document], "chunk_ids": [chunk]}), task_id))
+    db.execute("INSERT INTO research_messages(session_id,task_id,role,body,created_at) VALUES(?,?,'assistant',?,?)",
+               (task["session_id"], task_id, statement, db.now()))
+    with httpx.Client(trust_env=False) as requester:
+        response = requester.get(url)
+        with pytest.raises(httpx.HTTPStatusError) as failure:
+            response.raise_for_status()
+    knowledge.record_fetch_failure(document, failure.value)
+    feedback = client.post(path + "/feedback", data={"csrf": csrf, "task_id": task_id, "item_id": item,
+                                                     "kind": "outdated", "body": "请复核模块形态的适用版本"}, follow_redirects=False)
+    assert feedback.status_code == 303 and "反馈已保存" in unquote(feedback.headers["location"])
+    page = client.get(path)
+    tree = html.fromstring(page.content)
+    assert all(part in page.text for part in ("历史反馈记录", "已经过时", "请复核模块形态的适用版本", "当前核验状态：需要重新核验", statement, "HTTP 404"))
+    assert tree.xpath(f"//a[normalize-space(.)='本地归档原文']/@href") == [f"/documents/{document}?version={version}#chunk-{chunk}"]
+    assert tree.xpath("//a[contains(.,'外部原文链接')]/@href") == [url]
+    assert client.get(f"/documents/{document}?version={version}").status_code == 200
+    assert "请优先查看本地归档" in client.get("/evidence").text
 
 
 @pytest.mark.parametrize(("kind", "expected"), [("research", "interactive"), ("chat", "interactive"), ("summary", "revise")])
@@ -170,7 +574,7 @@ def test_upgrade_reuses_research_snapshot_with_old_ingest_settings(schema):
     write_json("config.json", current_config)
     resumed = ResearchRun(task)
     assert resumed.saved_request(key) == prepared
-    assert resumed.gateway.route.reasoning_effort == "high" and resumed.gateway.route.output_tokens == 8192
+    assert (resumed.gateway.route.reasoning_effort, resumed.gateway.route.output_tokens) == (("high", 8192) if schema == 6 else ("low", 4096))
 
     current_config["research"]["max_rounds"] += 1
     write_json("config.json", current_config)

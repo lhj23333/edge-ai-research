@@ -8,7 +8,7 @@
 <form action="/compare" method="get" class="panel compare-picker" data-compare-picker>
   <div class="panel-head"><h2>{{ icon('chip') }}选择产品</h2><span class="badge tone-accent" data-compare-count aria-live="polite">已选择 {{ chosen|length }} / 3</span></div>
   <div class="product-options">
-    {% for product in products %}<label class="select-card"><input type="checkbox" name="id" value="{{ product.id }}" {{ 'checked' if product.id in chosen else '' }}><span class="select-mark" aria-hidden="true">{{ icon('check') }}</span><span>{{ product.name }}</span></label>{% else %}<p class="muted">尚无产品记录。采集行业动态后可从厂商资料进入。</p>{% endfor %}
+    {% for product in products %}<label class="select-card"><input type="checkbox" name="id" value="{{ product.id }}" {{ 'checked' if product.id in chosen else '' }}><span class="select-mark" aria-hidden="true">{{ icon('check') }}</span><span>{{ product.name }}{% if product.aliases %}<small class="muted">（{{ product.aliases }}）</small>{% endif %}</span></label>{% else %}<p class="muted">尚无产品记录。采集行业动态后可从厂商资料进入。</p>{% endfor %}
   </div>
   <div class="form-actions"><button class="button primary" type="submit">{{ icon('bars') }}查看对比</button></div>
 </form>

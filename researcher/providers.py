@@ -1,6 +1,7 @@
 import asyncio
 import json
 import hashlib
+import math
 import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
@@ -13,7 +14,7 @@ from httpx_sse import EventSource, SSEError
 from markdown_it import MarkdownIt
 
 from . import db
-from .config import EffectiveRoute, Limits, secret, settings
+from .config import COST_PROFILES, EffectiveRoute, Limits, secret, settings
 
 
 ARK_SEARCH_ROUNDS = 3
@@ -28,7 +29,9 @@ class Cancelled(ResearchError):
 
 
 class BudgetExceeded(ResearchError):
-    pass
+    def __init__(self, message, reason="request_limit"):
+        super().__init__(message)
+        self.reason = reason
 
 
 class UnknownOutcome(ResearchError):
@@ -46,15 +49,44 @@ def yield_to_manual(connection=None):
         raise YieldResearch()
 
 
-def cost_windows(connection, limits, timestamp, day):
-    for label, limit, condition, value in (
-        ("每分钟", limits.minute_cost, "created_at>?", (timestamp - timedelta(minutes=1)).isoformat(timespec="microseconds")),
-        ("每小时", limits.hour_cost, "created_at>?", (timestamp - timedelta(hours=1)).isoformat(timespec="microseconds")),
-        ("每日", limits.daily_cost, "day=?", day),
-    ):
+def cost_windows(connection, limits, day):
+    for label, limit, start in (("每日", limits.daily_cost, day), ("每月", limits.monthly_cost, day[:7] + "-01")):
         if limit is not None:
-            spent = connection.execute("SELECT coalesce(sum(coalesce(estimate,reserved_estimate)),0) FROM usage WHERE " + condition + " AND status!='network_error'", (value,)).fetchone()[0]
+            spent = connection.execute("SELECT coalesce(sum(estimated_cost),0) FROM model_call_ledger "
+                                       "WHERE day BETWEEN ? AND ? AND status!='network_error'", (start, day)).fetchone()[0]
             yield label, limit, spent
+
+
+def topic_calls(connection, day):
+    return connection.execute("SELECT count(*) FROM usage u JOIN tasks t ON t.id=u.task_id "
+                              "WHERE u.day=? AND t.automatic=1 AND t.schedule_key LIKE 'topic-revision:%'", (day,)).fetchone()[0]
+
+
+def input_token_estimate(value):
+    serialized = json.dumps(value, ensure_ascii=False)
+    ascii_count = sum(character.isascii() for character in serialized)
+    return 64 + math.ceil(ascii_count / 3 + (len(serialized.encode()) - ascii_count) / 2.5)
+
+
+def operation_cost(profile, operation, input_tokens, output_tokens, searches=1):
+    if operation == "search":
+        return profile.search_price
+    if None in (input_tokens, output_tokens, profile.input_price, profile.output_price):
+        return None
+    generation = (input_tokens * profile.input_price + output_tokens * profile.output_price) / 1_000_000
+    if operation == "search_generate":
+        return None if profile.search_price is None or searches is None else generation + profile.search_price * searches
+    return generation
+
+
+def pricing_issue(profile, operation, step):
+    required = [] if operation == "search" else [("input_price", "输入单价"), ("output_price", "输出单价")]
+    if operation in {"search", "search_generate"}:
+        required.append(("search_price", "搜索单价"))
+    missing = [label for field, label in required if getattr(profile, field) is None]
+    if missing:
+        return f"已启用费用上限，模型 {profile.model}（{step}）缺少{'、'.join(missing)}。请在模型设置中填写。"
+    return ""
 
 
 def completion_choice(data):
@@ -117,7 +149,9 @@ class Gateway:
         config = settings()
         self.limits = Limits(**config["limits"])
         self.automatic_limit = config["research"]["automatic_daily_requests"]
+        self.topic_limit = COST_PROFILES[config["cost_profile"]].daily_topic_calls
         self.task = db.one("SELECT * FROM tasks WHERE id=?", (task_id,))
+        self.scheduled_topic = bool(self.task and self.task["automatic"] and (self.task["schedule_key"] or "").startswith("topic-revision:"))
         self.search_checks = {}
         if self.task and self.task.get("request_limit"):
             self.limits.task_requests = self.task["request_limit"]
@@ -130,7 +164,32 @@ class Gateway:
         if self.task and self.task.get("automatic"):
             automatic = db.one("SELECT count(*) AS n FROM usage u JOIN tasks t ON t.id=u.task_id WHERE u.day=? AND t.automatic=1", (day,))["n"]
             remaining = min(remaining, self.automatic_limit - automatic)
+        if self.scheduled_topic:
+            with db.open_database() as connection:
+                remaining = min(remaining, self.topic_limit - topic_calls(connection, day))
         return max(0, remaining)
+
+    def exhausted_budget(self):
+        if self.scheduled_topic:
+            quota = db.one("SELECT status,auto_released_at FROM topic_retry_quotas WHERE task_id=?", (self.task_id,))
+            if quota and (quota["status"] != "active" or quota["auto_released_at"] <= db.now()):
+                return BudgetExceeded("定时研究已达到执行时限", "schedule_timeout")
+            day = datetime.now(ZoneInfo(self.limits.timezone)).date().isoformat()
+            with db.open_database() as connection:
+                if topic_calls(connection, day) >= self.topic_limit:
+                    return BudgetExceeded("定时专题研究已达到每日调用配额", "schedule_daily_quota")
+        return BudgetExceeded("剩余调用额度已用尽，已保留原文与草稿")
+
+    def reached_cost_redline(self):
+        limits = Limits(**settings()["limits"])
+        if limits.daily_cost is None and limits.monthly_cost is None:
+            return None
+        day = datetime.now(ZoneInfo(limits.timezone)).date().isoformat()
+        with db.open_database() as connection:
+            for label, limit, spent in cost_windows(connection, limits, day):
+                if spent >= limit:
+                    return BudgetExceeded(f"已达到{label}总费用安全红线，已保留现有资料", "cost_safety_limit")
+        return None
 
     def checkpoint(self, progress=None):
         task = db.one("SELECT cancel_requested,status FROM tasks WHERE id=?", (self.task_id,))
@@ -139,30 +198,23 @@ class Gateway:
         if progress:
             db.execute("UPDATE tasks SET progress=?,heartbeat=? WHERE id=?", (progress, db.now(), self.task_id))
 
-    def request_cost(self, payload, operation):
+    @staticmethod
+    def request_tokens(payload, operation):
         if operation == "search":
-            return self.profile.search_price
-        # 用 UTF-8 字节数估算请求输入额度。
-        size = len(json.dumps(payload, ensure_ascii=False).encode()) + 128
+            return 0, 0
         output = payload.get("max_tokens") or payload.get("max_output_tokens") or payload.get("parameters", {}).get("max_tokens", 0)
-        searches = payload.get("max_tool_calls", 1)
-        return self.cost(operation, size, output, searches)
+        return input_token_estimate(payload), output
+
+    def request_cost(self, payload, operation):
+        return self.cost(operation, *self.request_tokens(payload, operation), payload.get("max_tool_calls", 1))
 
     def cost(self, operation, input_tokens, output_tokens, searches=1):
-        search_price = self.profile.search_price
-        if operation == "search":
-            return search_price
-        input_price, output_price = self.profile.input_price, self.profile.output_price
-        if None in (input_tokens, output_tokens, input_price, output_price):
-            return None
-        generation = (input_tokens * input_price + output_tokens * output_price) / 1_000_000
-        if operation == "search_generate":
-            return None if search_price is None or searches is None else generation + search_price * searches
-        return generation
+        return operation_cost(self.profile, operation, input_tokens, output_tokens, searches)
 
-    def reserve(self, operation, estimate=None, request_key=None):
+    def reserve(self, operation, estimate=None, request_key=None, tokens=(None, None)):
+        current_limits = Limits(**settings()["limits"])
         timestamp = datetime.now(timezone.utc)
-        day = timestamp.astimezone(ZoneInfo(self.limits.timezone)).date().isoformat()
+        day = timestamp.astimezone(ZoneInfo(current_limits.timezone)).date().isoformat()
         with db.transaction() as connection:
             task = connection.execute("SELECT status,cancel_requested,automatic,priority FROM tasks WHERE id=?", (self.task_id,)).fetchone()
             if not task or task["status"] != "running" or task["cancel_requested"]:
@@ -179,16 +231,30 @@ class Gateway:
                 automatic = connection.execute("SELECT count(*) FROM usage u JOIN tasks t ON t.id=u.task_id WHERE u.day=? AND t.automatic=1", (day,)).fetchone()[0]
                 if automatic >= self.automatic_limit:
                     raise BudgetExceeded("自动研究的每日请求额度已用尽，手动任务仍可使用剩余额度")
-            for label, limit, spent in cost_windows(connection, self.limits, timestamp, day):
-                if estimate is None:
-                    raise BudgetExceeded("已启用费用上限，请先填写此模型的输入、输出或搜索单价")
-                if spent + estimate > limit:
-                    raise BudgetExceeded(f"已达到{label}费用上限")
+            if self.scheduled_topic:
+                quota = connection.execute("SELECT status,auto_released_at FROM topic_retry_quotas WHERE task_id=?", (self.task_id,)).fetchone()
+                if quota and (quota["status"] != "active" or quota["auto_released_at"] <= timestamp.isoformat(timespec="seconds")):
+                    raise BudgetExceeded("定时研究已达到执行时限", "schedule_timeout")
+                if topic_calls(connection, day) >= self.topic_limit:
+                    raise BudgetExceeded("定时专题研究已达到每日调用配额", "schedule_daily_quota")
+            windows = list(cost_windows(connection, current_limits, day))
+            step = self.route.step if self.route else operation
+            if windows and estimate is None:
+                raise BudgetExceeded(pricing_issue(self.profile, operation, step)
+                                     or f"无法计算模型 {self.profile.model}（{step}）的单次预计费用", "pricing_unavailable")
+            for label, limit, spent in windows:
+                if spent >= limit or spent + estimate > limit:
+                    raise BudgetExceeded(f"已达到{label}总费用安全红线。单次预计费用 ¥{estimate:.8g}，"
+                                         f"窗口内已用 ¥{spent:.8g}，配置上限 ¥{limit:.8g}。", "cost_safety_limit")
             cursor = connection.execute(
-                "INSERT INTO usage(task_id,profile_id,provider,model,operation,created_at,day,price_note,route,evaluation_id,reserved_estimate) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO usage(task_id,profile_id,provider,model,operation,created_at,day,price_note,route,evaluation_id,reserved_estimate,"
+                "request_key,attempt_count,estimated_input_tokens,estimated_output_tokens,auto_released_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (self.task_id, self.profile.id, self.profile.provider, self.profile.model, operation, timestamp.isoformat(timespec="microseconds"), day, self.profile.price_note,
-                 self.route.step if self.route else "", self.evaluation_id, estimate),
+                 self.route.step if self.route else "", self.evaluation_id, estimate, request_key, count + 1, *tokens,
+                 (timestamp + timedelta(minutes=12)).isoformat(timespec="seconds")),
             )
+            if self.scheduled_topic:
+                connection.execute("UPDATE topic_retry_quotas SET attempt_count=attempt_count+1 WHERE task_id=?", (self.task_id,))
             if request_key:
                 connection.execute("UPDATE research_operations SET status='running',updated_at=? WHERE task_id=? AND operation_key=?", (db.now(), self.task_id, request_key))
             return cursor.lastrowid
@@ -258,26 +324,18 @@ class Gateway:
             self.checkpoint()
             try:
                 # 后台任务退避后重试时重新检查手动队列和额度。
-                usage_id = self.reserve(operation, self.request_cost(payload, operation), request_key)
+                usage_id = self.reserve(operation, self.request_cost(payload, operation), request_key, self.request_tokens(payload, operation))
             except BudgetExceeded:
                 self.failed_operation(request_key, "blocked", "剩余调用额度不足")
                 raise
             try:
                 timeout = 60 if self.route and not self.route.step.startswith("deep_") else 600
-                async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=15)) as client:
-                    url = str(self.profile.base_url).rstrip("/") + path
-                    headers = {"Authorization": f"Bearer {self.key}"}
-                    if payload.get("stream"):
-                        headers["Accept"] = "text/event-stream"
-                        async with client.stream("POST", url, headers=headers, json=payload) as response:
-                            if response.status_code < 400:
-                                result = await self.collect_stream(response)
-                            else:
-                                await response.aread()
-                                result = error_usage(response)
-                    else:
-                        response = await client.post(url, headers=headers, json=payload)
-                        result = response.json() if response.status_code < 400 else error_usage(response)
+                if self.scheduled_topic:
+                    quota = db.one("SELECT auto_released_at FROM topic_retry_quotas WHERE task_id=?", (self.task_id,))
+                    if quota:
+                        seconds = (datetime.fromisoformat(quota["auto_released_at"]) - datetime.now(timezone.utc)).total_seconds()
+                        timeout = min(timeout, max(0, seconds))
+                response, result = await asyncio.wait_for(self.send(path, payload, timeout), timeout)
                 if response.status_code in (408, 429, 500, 502, 503, 504) and attempt < 2:
                     self.record_retry(usage_id, request_key, "retry", result, operation)
                     self.checkpoint("服务商暂时不可用，等待有限重试")
@@ -308,9 +366,11 @@ class Gateway:
                     self.failed_operation(request_key, "failed", "无法连接服务商")
                     raise ResearchError("无法连接服务商，有限重试已结束，请检查本机网络和 API 地址") from None
                 await asyncio.sleep(2 ** (attempt + 1))
-            except (httpx.TransportError, SSEError) as error:
+            except (httpx.TransportError, SSEError, asyncio.TimeoutError) as error:
                 db.execute("UPDATE usage SET status='unknown' WHERE id=?", (usage_id,))
                 self.failed_operation(request_key, "unknown", "请求已发出，但未收到完整结果：" + type(error).__name__)
+                if self.scheduled_topic and quota and db.now() >= quota["auto_released_at"]:
+                    raise BudgetExceeded("定时研究已达到执行时限，已保留现有资料", "schedule_timeout") from None
                 raise UnknownOutcome(f"服务商请求已发出，但结果未知（{type(error).__name__}）；已保存资料，未自动重复请求") from None
             except asyncio.CancelledError:
                 db.execute("UPDATE usage SET status='interrupted' WHERE id=?", (usage_id,))
@@ -325,6 +385,23 @@ class Gateway:
                 self.failed_operation(request_key, "failed", "请求未成功")
                 raise
         raise ResearchError("请求未完成")
+
+    async def send(self, path, payload, timeout):
+        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=min(15, timeout))) as client:
+            url = str(self.profile.base_url).rstrip("/") + path
+            headers = {"Authorization": f"Bearer {self.key}"}
+            if payload.get("stream"):
+                headers["Accept"] = "text/event-stream"
+                async with client.stream("POST", url, headers=headers, json=payload) as response:
+                    if response.status_code < 400:
+                        result = await self.collect_stream(response)
+                    else:
+                        await response.aread()
+                        result = error_usage(response)
+            else:
+                response = await client.post(url, headers=headers, json=payload)
+                result = response.json() if response.status_code < 400 else error_usage(response)
+        return response, result
 
     def record_retry(self, usage_id, request_key, status, usage, operation):
         input_tokens = usage.get("prompt_tokens", usage.get("input_tokens"))
@@ -347,7 +424,7 @@ class Gateway:
             self.failed_operation(key, "invalid", f"模型返回内容未通过校验（{type(error).__name__}）")
             raise
 
-    async def search(self, query, request_key=None, reuse_query_key=None, reserve_requests=0):
+    async def search(self, query, request_key=None, reuse_query_key=None, reserve_requests=0, max_results=6):
         from .continuity import cached_operation, context_for_task, measurement_units, normalized
         if not self.task or self.task["kind"].startswith("test_"):
             return await self.search_uncached(query, request_key)
@@ -355,27 +432,29 @@ class Gateway:
         async def produce(cache_key):
             if self.remaining() <= reserve_requests:
                 raise BudgetExceeded("剩余调用已保留给整理与核验")
-            sources = await self.search_uncached(query, request_key or "search:" + cache_key)
+            sources = await self.search_uncached(query, request_key or "search:" + cache_key, max_results)
             return {"sources": [asdict(source) for source in sources]}
         inputs = {"query": normalized(query)}
+        if max_results < 6:
+            inputs["max_results"] = max_results
         if measurement_units(query):
             inputs["units"] = measurement_units(query)
         result = await cached_operation("search_web", inputs, context_for_task(self.task), self.task_id, produce, force=job.get("force_refresh", False), reuse_key=reuse_query_key)
         self.search_checks[request_key or query] = {key: result[key] for key in ("cache_key", "reused", "checked_at", "source_task_id")}
         if result.get("reused_query"):
             self.search_checks[request_key or query]["reused_query"] = result["reused_query"]
-        return [Source(**item) for item in result["sources"]]
+        return [Source(**item) for item in result["sources"][:max_results]]
 
-    async def search_uncached(self, query, request_key=None):
+    async def search_uncached(self, query, request_key=None, max_results=6):
         provider = self.profile.provider
         if provider == "deepseek":
-            data = await self.post("/tools/search", {"query": query[:128], "count": 6, "need_content": True}, "search", request_key)
+            data = await self.post("/tools/search", {"query": query[:128], "count": max_results, "need_content": True}, "search", request_key)
             return [normalized_source(item["title"], item["url"], item.get("content") or item.get("summary") or item.get("snippet", ""), "网页内容（服务商提取）" if item.get("content") else "搜索摘要", item.get("date")) for item in data["results"]]
         if provider == "zhipu":
-            data = await self.post("/web_search", {"search_engine": "search_pro", "search_query": query, "count": 6, "content_size": "high"}, "search", request_key)
+            data = await self.post("/web_search", {"search_engine": "search_pro", "search_query": query, "count": max_results, "content_size": "high"}, "search", request_key)
             return [normalized_source(item["title"], item["link"], item.get("content", ""), "搜索摘要", item.get("publish_date")) for item in data["search_result"]]
         if provider == "moonshot":
-            data = await self.post("/tools/search_pro", {"text_query": query, "limit": 6, "timeout_seconds": 40}, "search", request_key)
+            data = await self.post("/tools/search_pro", {"text_query": query, "limit": max_results, "timeout_seconds": 40}, "search", request_key)
             return [normalized_source(item["title"], item["url"], "\n".join(chunk["text"] for chunk in item.get("chunks", [])) or item.get("snippet", ""), "网页相关段落" if item.get("chunks") else "搜索摘要", item.get("date")) for item in data["search_results"]]
         raise ResearchError("当前服务商不支持独立搜索接口")
 

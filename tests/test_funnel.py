@@ -6,13 +6,13 @@ from pathlib import Path
 import httpx
 import pytest
 
-from researcher import db, knowledge, research, station
+from researcher import continuity, db, knowledge, research, station
 from researcher.config import DATA, ROOT, Profile, save_profile, settings, write_json
 from researcher.ingest import benchmark, briefing, jobs
 from researcher.ingest.cluster import Decision, assign, commit, confirmed, correct_assignment, shortlist
 from researcher.ingest.collectors import DATE_PROBE_BYTES, Entry, FeedConfig, save_source, stamp
 from researcher.ingest.funnel import NamedEntity, Prefilter, Score, Writeup, assessment_row, average_score, evaluate, model_request, parse_assessment, process_item, save_assessment, save_original
-from researcher.ingest.gate import observe
+from researcher.ingest.gate import body_gate, observe
 from researcher.industry import selection
 from researcher.providers import BudgetExceeded, Gateway, Source, YieldResearch
 from researcher.research_engine import ResearchRun
@@ -26,6 +26,16 @@ HAILO_URL = "https://hailo.ai/products/ai-accelerators/hailo-10h-ai-accelerator/
 HAILO_SUMMARY = "Hailo-10H 支持在边缘设备上执行生成式 AI 推理。"
 RASPBERRY_TITLE = "Citizen science with Raspberry Pi"
 RASPBERRY_SUMMARY = "This Maker Monday, we look at ways environmentalists are using Raspberry Pi to understand the world around them."
+
+
+@pytest.mark.parametrize(("body", "reason"), [
+    ("", "empty_body"),
+    ("点击查看原文：" + HAILO_URL, "link_only"),
+    (HAILO_TITLE, "short_body"),
+    ((HAILO_TITLE + " ") * 30, "low_information"),
+])
+def test_body_gate_rejects_unusable_extractions(body, reason):
+    assert body_gate(body) == reason
 
 
 def record_prefilter(task_id, item, decision):
@@ -117,7 +127,7 @@ def test_pending_date_prefilters_before_http_and_rechecks_publication(tmp_path, 
         save_profile(profile, "unused-budget-test-key")
         config = settings()
         config["active_profile"] = profile.id
-        config["limits"]["minute_cost"] = 0.000001
+        config["limits"]["daily_cost"] = 0.000001
         write_json("config.json", config)
 
     async def process():
@@ -125,7 +135,7 @@ def test_pending_date_prefilters_before_http_and_rechecks_publication(tmp_path, 
             await process_item(task_id, item, client, policy, asyncio.Semaphore(1))
 
     if scenario == "recent":
-        with pytest.raises(BudgetExceeded, match="每分钟费用上限"):
+        with pytest.raises(BudgetExceeded, match="每日总费用安全红线"):
             asyncio.run(process())
     else:
         asyncio.run(process())
@@ -277,6 +287,28 @@ def selected_report(source_id, publisher, tier, url, writeup, published, score=9
     return db.one("SELECT * FROM feed_items WHERE id=?", (identifier,))
 
 
+def test_archived_redirect_body_never_reaches_the_scoring_model():
+    now = datetime.now(timezone.utc)
+    source = save_source(FeedConfig(key="hailo", name="Hailo", kind="external", tier="T1", publisher="hailo", enabled=True))
+    writeup = Writeup(title=HAILO_TITLE, summary="查看原文：" + HAILO_URL, importance_reason="产品原文链接", event_type="产品发布")
+    item = selected_report(source, "hailo", "T1", HAILO_URL, writeup, now)
+    db.execute("UPDATE feed_items SET state='discovered',score=NULL WHERE id=?", (item["id"],))
+    item = db.one("SELECT * FROM feed_items WHERE id=?", (item["id"],))
+    task_id = jobs.enqueue(poll=False)
+    assert claim_task(False)["id"] == task_id
+
+    async def process():
+        async with httpx.AsyncClient(trust_env=False) as client:
+            await process_item(task_id, item, client, selection(), asyncio.Semaphore(1))
+
+    asyncio.run(process())
+    assert db.one("SELECT state,gate_reason FROM feed_items WHERE id=?", (item["id"],)) == {
+        "state": "prefiltered_out", "gate_reason": "link_only",
+    }
+    assert not db.query("SELECT id FROM item_evaluations")
+    assert not db.query("SELECT id FROM model_call_ledger")
+
+
 def test_automatic_commit_preserves_manually_locked_event(client, csrf):
     now = datetime.now(timezone.utc).replace(microsecond=0)
     policy = selection()
@@ -370,6 +402,18 @@ def test_sqlite_vec_recall_with_cached_bge_m3(cached_bge_m3):
     assert not knowledge.recall_events(HAILO_TITLE, now + timedelta(seconds=1), 5)
 
 
+def test_identical_text_reuses_persisted_embedding(cached_bge_m3):
+    text = HAILO_TITLE + "\n" + HAILO_SUMMARY
+    first, duplicate = knowledge.cached_embeddings([text, text], knowledge.EVENT_MODEL, "cpu")
+    assert first.tobytes() == duplicate.tobytes() and first.size == knowledge.EVENT_DIMENSION
+    entry = db.one("SELECT content_hash,value FROM content_cache")
+    assert entry == {"content_hash": continuity.text_hash(text), "value": first.tobytes()}
+    knowledge.embedding_model.cache_clear()
+    cached, = knowledge.cached_embeddings([text], knowledge.EVENT_MODEL, "cpu")
+    assert cached.tobytes() == first.tobytes()
+    assert knowledge.embedding_model.cache_info().misses == 0
+
+
 def test_cross_version_cluster_routes_use_local_recall_and_review_only_uncertain(cached_bge_m3):
     now = datetime.now(timezone.utc).replace(microsecond=0)
     policy = selection()
@@ -427,6 +471,9 @@ def test_scheduler_polls_enabled_sources_and_compiles_daily_briefing(raspberry_f
     assert db.one("SELECT status,new_count FROM feed_runs WHERE source_id=?", (source_id,)) == {"status": "success", "new_count": 1}
     assert db.one("SELECT state FROM feed_items")["state"] == "gated_archive"
     assert db.one("SELECT count(*) AS n FROM daily_briefings")["n"] == 1
+    saved = db.one("SELECT body,evidence_hash,polished FROM daily_briefings")
+    assert RASPBERRY_TITLE in saved["body"] and not saved["polished"]
+    assert briefing.compose()["evidence_hash"] == saved["evidence_hash"]
     assert not db.query("SELECT id FROM usage")
 
 

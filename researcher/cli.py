@@ -14,7 +14,7 @@ from contextlib import ExitStack
 from pathlib import Path
 
 from . import db
-from .config import DATA, ROOT, Limits, Profile, ResearchSettings, config_lock, model_routes, prepare_data, read_json, write_json
+from .config import DATA, ROOT, CostSettings, Limits, Profile, ResearchSettings, config_lock, prepare_data, read_json, stored_routes, write_json
 
 
 def lock_file(name):
@@ -108,9 +108,10 @@ def restore(source, replace=False):
             with archive.open("researcher.sqlite3") as source_file, snapshot_path.open("wb") as output_file:
                 shutil.copyfileobj(source_file, output_file)
             config = json.loads(archive.read("config.json"))
+            CostSettings.model_validate(config)
             Limits(**config.get("limits", {}))
             ResearchSettings(**config.get("research", {}))
-            model_routes(config.get("model_routes", {}))
+            stored_routes(config.get("model_routes", {}))
             for item in config.get("profiles", []):
                 Profile(**item)
                 item["chat_verified"] = None
@@ -135,6 +136,8 @@ def restore(source, replace=False):
                 snapshot.execute("UPDATE feed_runs SET status='interrupted',error='从备份恢复',finished_at=? WHERE status='running'", (db.now(),))
             if version >= 10:
                 snapshot.execute("UPDATE topic_research_schedules SET next_run=NULL")
+            if version >= 12:
+                snapshot.execute("UPDATE topic_retry_quotas SET status='finished' WHERE status='active'")
             snapshot.execute("UPDATE usage SET status='interrupted' WHERE status='reserved'")
             snapshot.execute("DELETE FROM runtime")
             snapshot.commit()

@@ -14,9 +14,9 @@ from researcher.config import Profile, save_profile, settings, write_json
 from researcher.industry import selection
 from researcher.ingest import benchmark, jobs
 from researcher.ingest.cluster import Decision, commit
-from researcher.ingest.collectors import FeedConfig, save_source, stamp
+from researcher.ingest.collectors import Entry, FeedConfig, save_source, stamp
 from researcher.ingest.funnel import NamedEntity, Writeup, save_original
-from researcher.ingest.gate import processing_source
+from researcher.ingest.gate import observe, processing_source
 from researcher.providers import ResearchError, Source
 from researcher.research_engine import ResearchRun
 from researcher.station_web import reading_snapshot
@@ -43,6 +43,110 @@ def test_preview_and_collect_endpoint_use_the_same_publication_rules(client, csr
     assert task["kind"] == "feed" and not task["session_id"] and task["priority"] < 0
     assert station.decode(task["job_json"])["source_ids"] == [db.one("SELECT id FROM feed_sources WHERE source_key='raspberry-pi'")["id"]]
     assert client.get(queued.headers["location"]).status_code == 200
+
+
+def test_web_list_preview_reports_individual_detail_results_and_listing_failure(client, csrf, served_folder, tmp_path):
+    dates = {
+        "published-time": '<meta property="article:published_time" content="2026-07-09T16:22:00+09:00">',
+        "pubdate": '<meta name="pubdate" content="2026/07/09">',
+        "time-tag": '<time datetime="2026-07-09">July 9, 2026</time>',
+        "json-ld": '<script type="application/ld+json">{"@graph":[{"@type":"NewsArticle","datePublished":"July 9, 2026"}]}</script>',
+        "no-date": "<p>DX-M1 now runs SLMs fully on-device.</p>",
+    }
+    for name, markup in dates.items():
+        prefix = "<!--" + " " * (160 * 1024) + "-->" if name == "published-time" else ""
+        (tmp_path / f"{name}.html").write_text(f"<html>{prefix}{markup}</html>", encoding="utf-8")
+    items = [*dates, "not-served"]
+    (tmp_path / "news.html").write_text("<main>" + "".join(
+        f'<article><h2><a href="/{name}.html">DX-M1 news — {name}</a></h2></article>' for name in items
+    ) + "</main>", encoding="utf-8")
+    data = {"csrf": csrf, "key": "deepx-news", "name": "DEEPX 官方新闻", "kind": "web_list", "tier": "T1",
+            "publisher": "deepx", "url": served_folder + "/news.html",
+            "options": json.dumps({"item": "article", "title": "h2", "url": "h2 a", "detail_date": 'meta[property="article:published_time"]'})}
+    path = "/admin/sources/preview"
+    headers = {"Accept": "application/json"}
+    response = client.post(path, data=data, headers=headers)
+    assert response.status_code == 200
+    rows = response.json()["items"]
+    assert [row["date_status"] for row in rows] == ["confirmed"] * 4 + ["date_not_found", "detail_request_failed"]
+    assert rows[0]["published_at"] == "2026-07-09T07:22:00+00:00"
+    assert all(row["published_at"] == "2026-07-09T00:00:00+00:00" for row in rows[1:4])
+    assert "detail_date 或 date_format" in rows[4]["error"] and "HTTP 404" in rows[5]["error"]
+    view = html.fromstring(client.post(path, data=data).content)
+    assert "HTTP 404" in view.xpath("string(//article[@data-date-status='detail_request_failed'])")
+    assert "DX-M1 news" in view.xpath("string(//article[@data-date-status='date_not_found'])")
+    data["url"] = served_folder + "/absent-list.html"
+    response = client.post(path, data=data, headers=headers)
+    assert response.status_code == 422
+    assert response.json() == {"code": "list_request_failed", "error": "列表页请求失败（HTTP 404）"}
+    assert "列表页请求失败" in client.post(path, data=data).text
+
+
+def test_archived_items_support_release_score_and_audited_event_selection(client, csrf, served_folder, tmp_path):
+    now = datetime.now(timezone.utc)
+    published = now - timedelta(days=35)
+    title = "Hailo-10H Edge AI Accelerator"
+    summary = "Hailo-10H supports edge generative AI applications in a standard M.2 form factor."
+    for filename in ("products", "deployment"):
+        (tmp_path / f"{filename}.html").write_text(
+            f'<html><head><title>{title}</title><meta name="pubdate" content="{stamp(published)}"></head>'
+            f"<body><article><h1>{title}</h1><p>{summary}</p></article></body></html>", encoding="utf-8",
+        )
+    feed = FeedConfig(key="hailo-releases", name="Hailo 官方资料", kind="rss", tier="T1", publisher="hailo",
+                      url=served_folder + "/feed.xml", enabled=True, published_after=stamp(now - timedelta(days=14)))
+    source_id = save_source(feed)
+    with db.transaction() as connection:
+        source = connection.execute("SELECT * FROM feed_sources WHERE id=?", (source_id,)).fetchone()
+        observe(connection, source, [Entry(served_folder + f"/{name}.html", title, summary, published) for name in ("products", "deployment")],
+                now, selection())
+    release_item, manual_item = db.query("SELECT * FROM feed_items ORDER BY id")
+    assert {item["state"] for item in (release_item, manual_item)} == {"gated_archive"}
+    profile = Profile(id="glm", name="智谱", provider="zhipu", model="GLM-5.2", base_url="https://open.bigmodel.cn/api/paas/v4",
+                      input_price=8, output_price=28)
+    save_profile(profile, secrets.token_urlsafe())
+    config = settings()
+    config["limits"]["daily_cost"] = 0.000001
+    write_json("config.json", config)
+
+    release = f"/admin/funnel/{release_item['id']}"
+    assert "送回评估" in client.get(f"/admin/funnel?item_id={release_item['id']}").text
+    client.post(release + "/retry", data={"csrf": csrf})
+    assert db.one("SELECT state FROM feed_items WHERE id=?", (release_item["id"],))["state"] == "gated_archive"
+    response = client.post(release + "/retry", data={"csrf": csrf, "reason": "补评官方产品公告"}, follow_redirects=False)
+    assert response.headers["location"].startswith("/tasks/")
+    assert db.one("SELECT state,gate_reason,manual_release FROM feed_items WHERE id=?", (release_item["id"],)) == {
+        "state": "discovered", "gate_reason": "", "manual_release": 1,
+    }
+    task = claim_task(foreground=False)
+    asyncio.run(jobs.perform(task))
+    assert db.one("SELECT stage FROM item_evaluations WHERE item_id=?", (release_item["id"],))["stage"] == "prefilter"
+    release_view = client.get(f"/admin/funnel?item_id={release_item['id']}")
+    assert "人工操作记录" in release_view.text and "补评官方产品公告" in release_view.text
+
+    source = Source(title, "https://hailo.ai/products/ai-accelerators/hailo-10h-ai-accelerator/", summary, "公开资料", stamp(published))
+    document, version = station.save_document(source, None)
+    claim = station.save_claim(document, version, summary, summary, "厂商宣称")
+    event, _ = station.add_event({"identity_key": "hailo|10h|announcement", "event_type": "产品发布",
+                                  "title": title, "what_happened": summary, "why_important": "公布模块形态。"}, [claim], [], [])
+    path = f"/admin/funnel/{manual_item['id']}"
+    score = client.post(path + "/score", data={"csrf": csrf, "score": 90, "reason": "有厂商原文和发布日期"})
+    assert "评分已达门槛，待继续处理" in score.text
+    assert client.post(path + "/assign", data={"csrf": csrf, "event_id": event, "reason": "同一型号发布"}).status_code == 200
+    response = client.post(path + "/retry", data={"csrf": csrf}, follow_redirects=False)
+    assert response.headers["location"].startswith("/tasks/")
+    task = claim_task(foreground=False)
+    asyncio.run(jobs.perform(task))
+    item = db.one("SELECT * FROM feed_items WHERE id=?", (manual_item["id"],))
+    assert (item["state"], item["manual_target_event_id"], item["score"], item["manual_score"]) == ("selected", event, None, 90)
+    assert item["version_id"] and db.query("SELECT stage FROM item_evaluations WHERE item_id=?", (item["id"],)) == [{"stage": "write"}]
+    assert db.query("SELECT action FROM feed_manual_reviews WHERE item_id=? ORDER BY id", (item["id"],)) == [
+        {"action": "score"}, {"action": "assignment"}, {"action": "release"},
+    ]
+    writeup = Writeup(title=title, summary=summary, importance_reason="公布模块形态", event_type="产品发布")
+    decision = Decision(relation="new_event", confidence="high", event_id=None, reason="独立候选")
+    assert commit(item, writeup, decision, [], False, now, selection()) == event
+    assert db.one("SELECT manual,final_event_id FROM event_cluster_decisions WHERE item_id=?", (item["id"],)) == {"manual": 1, "final_event_id": event}
+    assert not db.query("SELECT id FROM usage")
 
 
 def test_routes_and_event_research_bind_local_evidence(client, csrf):
@@ -273,7 +377,7 @@ def test_selectbench_aggregates_tier_metrics_for_publication_date_baseline():
     assert report["by_tier"]["T2"]["f1"] == pytest.approx(1 / 2)
 
 
-def test_eval_queues_each_split_and_budget_stop_is_not_a_completed_report(client, csrf):
+def test_eval_compares_profiles_and_keeps_partial_results_at_the_safety_limit(client, csrf):
     profile = Profile(id="glm", name="智谱", provider="zhipu", model="glm-5.2", base_url="https://open.bigmodel.cn/api/paas/v4", input_price=10, output_price=10)
     save_profile(profile, secrets.token_urlsafe())
     config = settings()
@@ -281,7 +385,9 @@ def test_eval_queues_each_split_and_budget_stop_is_not_a_completed_report(client
     write_json("config.json", config)
 
     def enqueue(split):
-        response = client.post("/admin/eval", data={"csrf": csrf, "split": split}, follow_redirects=False)
+        response = client.post("/admin/eval", data={"csrf": csrf, "split": split, "compare": "yes",
+                                                   "variant": ["eco", "balanced", "deep", "custom"],
+                                                   "score": profile.id}, follow_redirects=False)
         assert response.status_code == 303
         return response.headers["location"]
 
@@ -295,15 +401,18 @@ def test_eval_queues_each_split_and_budget_stop_is_not_a_completed_report(client
     for task in db.query("SELECT job_json FROM tasks ORDER BY id"):
         job = station.decode(task["job_json"])
         assert job["samples"] and all(row["split"] == job["split"] for row in job["samples"])
-    assert running["request_limit"] == 3 * len(station.decode(running["job_json"])["samples"])
     asyncio.run(benchmark.perform(running))
     outcome = db.one("SELECT status,progress,error,result_json FROM tasks WHERE id=?", (running["id"],))
-    assert outcome["status"] == "failed" and outcome["progress"] == "评测未完成"
+    assert outcome["status"] == "failed" and outcome["progress"] == "评测部分完成"
     assert "每日" in outcome["error"] and "费用" in outcome["error"]
     report = station.decode(outcome["result_json"])
-    assert report["metrics"]["coverage"] == 0
-    assert sum(tier["total"] for tier in report["by_tier"].values()) == 10
-    assert "查看评测任务与用量" not in client.get("/admin/eval").text
+    assert set(report["comparison"]) == {"eco", "balanced", "deep", "custom"}
+    for run in report["comparison"].values():
+        assert 0 < run["metrics"]["coverage"] < 1
+        assert run["metrics"]["accuracy"] == 1
+        assert run["usage"]["calls"] == 0
+        assert sum(tier["total"] for tier in run["by_tier"].values()) == 10
+    assert "查看评测任务与用量" in client.get("/admin/eval").text
     assert not db.query("SELECT id FROM usage")
 
 

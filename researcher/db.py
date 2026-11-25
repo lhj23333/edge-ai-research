@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .config import DATA, config_lock, prepare_data
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 12
 
 
 def now(*, timespec="seconds"):
@@ -50,6 +50,10 @@ def initialize():
             if target == 6:
                 connection.execute("PRAGMA foreign_keys=OFF")
             connection.executescript(f"BEGIN IMMEDIATE;\n{script.read_text()}\nPRAGMA user_version={target};")
+            if target == 11:
+                from .station import merge_existing_product_aliases
+
+                merge_existing_product_aliases(connection)
             if connection.execute("PRAGMA foreign_key_check").fetchone():
                 connection.rollback()
                 raise RuntimeError(f"数据库迁移 {target:03d} 的关联检查未通过")

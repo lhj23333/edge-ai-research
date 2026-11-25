@@ -100,12 +100,15 @@ def home_context():
     now = datetime.now(timezone.utc)
     state, latest, catchup_events = reading_snapshot(now)
     issue = briefing.content(now)
+    polished = db.one("SELECT polished FROM daily_briefings WHERE day=? AND evidence_hash=?",
+                      (issue["day"], issue["evidence_hash"])) if briefing.polish_enabled(settings()) else None
     day, start, _ = briefing.day_bounds(now, settings()["limits"]["timezone"])
     cutoff = state["last_visit_at"]
     catchup_revisions = briefing.revisions_since(cutoff) if cutoff else []
     progress = db.query("SELECT t.id,t.title,t.question,j.purpose,v.conclusion,v.status,v.created_at FROM topics t LEFT JOIN judgments j ON j.topic_id=t.id LEFT JOIN judgment_versions v ON v.id=j.current_version_id WHERE t.research_state='active' ORDER BY t.id,j.purpose")
     questions = db.query("SELECT question FROM research_gaps WHERE status IN ('open','deferred') AND updated_at>=? ORDER BY priority DESC LIMIT 8", (stamp(start),))
     return {"station": state, "day": day, "events": issue["events"], "background_events": issue["background"], "revisions": issue["revisions"],
+            "polished_briefing": polished["polished"] if polished else "",
             "progress": progress, "next_questions": [row["question"] for row in questions], "catchup_events": catchup_events,
             "catchup_revisions": catchup_revisions, "reading_at": now.isoformat(timespec="microseconds"), "reading_feed_at": latest,
             "task_count": db.one("SELECT count(*) AS n FROM tasks WHERE status IN ('queued','running')")["n"], **dashboard_context()}
@@ -134,7 +137,7 @@ def dashboard_context():
     products = db.query(
         "SELECT e.id,e.name,(SELECT value FROM entity_fields f WHERE f.entity_id=e.id AND f.field_name='性能' ORDER BY f.id DESC LIMIT 1) AS performance,"
         "(SELECT count(DISTINCT field_name) FROM entity_fields f WHERE f.entity_id=e.id AND f.field_name IN (" + ",".join("?" for _ in COMPARE_FIELDS) + ")) AS dimensions "
-        "FROM entities e WHERE e.kind='产品' AND e.state!='archived' ORDER BY dimensions DESC,e.name LIMIT 4",
+        "FROM entities e WHERE e.kind='产品' AND e.state!='archived' AND e.canonical_entity_id IS NULL ORDER BY dimensions DESC,e.name LIMIT 4",
         COMPARE_FIELDS,
     )
     return {
@@ -362,15 +365,15 @@ def register(app, page, form_data, redirect, required, text):
         now, policy = datetime.now(timezone.utc), selection()
         topics = event_topics(event_id, now, policy)
         revisions = db.query("SELECT v.*,j.purpose,t.title AS topic_title,j.topic_id FROM judgment_versions v JOIN judgments j ON j.id=v.judgment_id JOIN topics t ON t.id=j.topic_id WHERE v.event_id=? OR v.event_id IN (SELECT id FROM events WHERE canonical_event_id=?) ORDER BY v.id DESC", (event_id, event_id))
-        materials = evidence_store.event_documents(event_id)
+        materials = evidence_store.document_access(evidence_store.event_documents(event_id))
         show_heat([event], now, policy)
-        return page(request, "event.html", title=event["title"], event=event, claims=claims, entities=entities, topics=topics, revisions=revisions,
+        return page(request, "event.html", title=event["title"], event=event, claims=evidence_store.document_access(claims), entities=entities, topics=topics, revisions=revisions,
                     materials=list(reversed(materials)) if timeline == "desc" else materials, timeline=timeline,
                     latest_research=db.one("SELECT id,session_id,status FROM tasks WHERE kind='event_research' AND json_extract(job_json,'$.target_id')=? ORDER BY id DESC LIMIT 1", (event_id,)))
 
     @router.post("/events/{event_id}/research")
     def research_event(event_id: RecordId, form=Depends(form_data)):
-        required("SELECT id FROM events WHERE id=?", (event_id,))
+        event = required("SELECT id,title FROM events WHERE id=?", (event_id,))
         try:
             task_id = research.enqueue_event(event_id)
             task = db.one("SELECT session_id FROM tasks WHERE id=?", (task_id,))
@@ -391,7 +394,8 @@ def register(app, page, form_data, redirect, required, text):
             args.append(label)
         claims = db.query(f"SELECT c.*,d.title AS document_title,d.url,d.published_at,d.last_fetched_at,d.extent,{CLAIM_CHUNK} FROM claims c JOIN documents d ON d.id=c.document_id " + ("WHERE " + " AND ".join(where) if where else "") + " ORDER BY c.id DESC LIMIT 150", tuple(args))
         label_counts = {row["label"]: row["n"] for row in db.query("SELECT c.label,count(*) AS n FROM claims c JOIN documents d ON d.id=c.document_id " + search[0] + " GROUP BY c.label", search[1])}
-        return page(request, "evidence.html", title="证据管理", claims=claims, documents=db.query("SELECT * FROM documents ORDER BY id DESC LIMIT 30"), q=q, label=label, labels=LABEL_ORDER, label_counts=label_counts)
+        documents = evidence_store.document_access(db.query("SELECT * FROM documents ORDER BY id DESC LIMIT 30"))
+        return page(request, "evidence.html", title="证据管理", claims=evidence_store.document_access(claims), documents=documents, q=q, label=label, labels=LABEL_ORDER, label_counts=label_counts)
 
     @router.get("/documents/{document_id}", response_class=HTMLResponse)
     def document_page(request: Request, document_id: RecordId, version: OptionalRecordId = None):
@@ -404,7 +408,8 @@ def register(app, page, form_data, redirect, required, text):
         chunks = db.query("SELECT * FROM document_chunks WHERE version_id=? ORDER BY position", (selected["id"],)) if selected else []
         checks = db.query("SELECT ce.*,c.statement,dc.version_id FROM claim_evidence ce JOIN claims c ON c.id=ce.claim_id JOIN document_chunks dc ON dc.id=ce.chunk_id WHERE c.document_id=? ORDER BY ce.created_at DESC", (document_id,))
         snapshots = db.query("SELECT id,version_id,content_type,method,length(body) AS bytes,created_at FROM source_snapshots WHERE version_id IN (SELECT id FROM document_versions WHERE document_id=?) ORDER BY id DESC", (document_id,))
-        return page(request, "document.html", title=document["title"], document=document, versions=versions, claims=claims, chunks=chunks, selected_version=selected["id"] if selected else None, evidence_checks=checks, snapshots=snapshots)
+        evidence_store.document_access([document])
+        return page(request, "document.html", title=document["title"], document=document, versions=versions, claims=evidence_store.document_access(claims), chunks=chunks, selected_version=selected["id"] if selected else None, evidence_checks=checks, snapshots=snapshots)
 
     @router.get("/documents/{document_id}/snapshots/{snapshot_id}")
     def download_snapshot(document_id: RecordId, snapshot_id: RecordId):
@@ -448,30 +453,57 @@ def register(app, page, form_data, redirect, required, text):
     @router.get("/entities/{entity_id}", response_class=HTMLResponse)
     def entity_page(request: Request, entity_id: RecordId):
         item = required("SELECT * FROM entities WHERE id=?", (entity_id,))
+        if item["canonical_entity_id"]:
+            return redirect(f"/entities/{item['canonical_entity_id']}", "重复产品的资料已归并到此档案")
         fields = db.query("SELECT f.*,c.label,c.verification,d.url,d.title AS document_title FROM entity_fields f LEFT JOIN claims c ON c.id=f.claim_id LEFT JOIN documents d ON d.id=c.document_id WHERE f.entity_id=? ORDER BY f.field_name,f.id DESC", (entity_id,))
         relations = db.query("SELECT r.*,a.name AS source_name,b.name AS target_name,CASE WHEN r.from_entity_id=? THEN b.id ELSE a.id END AS other_id,c.label,d.url FROM relations r JOIN entities a ON a.id=r.from_entity_id JOIN entities b ON b.id=r.to_entity_id LEFT JOIN claims c ON c.id=r.claim_id LEFT JOIN documents d ON d.id=c.document_id WHERE r.from_entity_id=? OR r.to_entity_id=? ORDER BY r.id DESC", (entity_id, entity_id, entity_id))
         events = db.query("SELECT e.* FROM event_entities ee JOIN events e ON e.id=ee.event_id WHERE ee.entity_id=? AND e.state='active' ORDER BY e.id DESC LIMIT 20", (entity_id,))
         products = db.query("SELECT * FROM entities WHERE parent_id=? AND state!='archived' ORDER BY name", (entity_id,))
-        official_sources = db.query("SELECT id,name,url,enabled FROM feed_sources WHERE tier='T1' AND owner_entity_id=? ORDER BY enabled DESC,name", (item["parent_id"] or entity_id,))
-        return page(request, "entity.html", title=item["name"], item=item, fields=fields, relations=relations, events=events, products=products, dimensions=COMPARE_FIELDS, official_sources=official_sources)
+        official_sources = db.query("SELECT id,name,url,enabled FROM feed_sources WHERE tier='T1' AND owner_entity_id IN (?,?) ORDER BY enabled DESC,name", (item["parent_id"], entity_id))
+        aliases = db.query("SELECT name FROM entity_aliases WHERE entity_id=? ORDER BY name", (entity_id,))
+        merged_claims = db.query("SELECT c.statement,c.document_id,c.document_version_id,d.title FROM entity_claims ec "
+                                 "JOIN claims c ON c.id=ec.claim_id LEFT JOIN documents d ON d.id=c.document_id "
+                                 "WHERE ec.entity_id=? ORDER BY c.id DESC", (entity_id,))
+        targets = db.query("SELECT id,name FROM entities WHERE kind='产品' AND canonical_entity_id IS NULL "
+                           "AND id!=? AND state!='archived' AND (parent_id IS NULL OR ? IS NULL OR parent_id=?) ORDER BY name",
+                           (entity_id, item["parent_id"], item["parent_id"])) if item["kind"] == "产品" else []
+        return page(request, "entity.html", title=item["name"], item=item, fields=fields, relations=relations, events=events, products=products, dimensions=COMPARE_FIELDS,
+                    official_sources=official_sources, aliases=aliases, merged_claims=merged_claims, merge_targets=targets)
+
+    @router.post("/entities/{entity_id}/merge")
+    def merge_entity(entity_id: RecordId, form=Depends(form_data)):
+        required("SELECT id FROM entities WHERE id=?", (entity_id,))
+        try:
+            target_id = parse_record_id(form.get("target_id"))
+            with db.transaction() as connection:
+                target_id = station.merge_product(connection, entity_id, target_id)
+            return redirect(f"/entities/{target_id}", "重复产品及其资料已归并")
+        except ValueError as error:
+            return redirect(f"/entities/{entity_id}", error=str(error))
 
     @router.post("/entities/{entity_id}/follow")
     def follow_entity(entity_id: RecordId, form=Depends(form_data)):
         item = required("SELECT * FROM entities WHERE id=?", (entity_id,))
+        if item["canonical_entity_id"]:
+            return redirect(f"/entities/{item['canonical_entity_id']}", error="请在规范产品档案操作")
         value = str(form.get("follow")) == "yes"
         db.execute("UPDATE entities SET followed=?,state=?,updated_at=? WHERE id=?", (int(value), "active" if value else item["state"], db.now(), entity_id))
         return redirect(f"/entities/{entity_id}", "关注状态已更新")
 
     @router.post("/entities/{entity_id}/archive")
     def archive_entity(entity_id: RecordId, form=Depends(form_data)):
-        required("SELECT id FROM entities WHERE id=?", (entity_id,))
+        item = required("SELECT canonical_entity_id FROM entities WHERE id=?", (entity_id,))
+        if item["canonical_entity_id"]:
+            return redirect(f"/entities/{item['canonical_entity_id']}", error="请在规范产品档案操作")
         db.execute("UPDATE entities SET state='archived',followed=0,updated_at=? WHERE id=?", (db.now(), entity_id))
         return redirect("/companies", "资料已归档，历史记录仍可查阅")
 
     @router.get("/compare", response_class=HTMLResponse)
     def compare(request: Request, ids: Annotated[list[RecordId] | None, Query(alias="id")] = None):
-        products = db.query("SELECT * FROM entities WHERE kind='产品' AND state!='archived' ORDER BY name")
-        requested = set(ids or [])
+        products = db.query("SELECT e.*,(SELECT group_concat(a.name,'、') FROM entity_aliases a WHERE a.entity_id=e.id) AS aliases "
+                            "FROM entities e WHERE kind='产品' AND state!='archived' AND canonical_entity_id IS NULL ORDER BY name")
+        with db.open_database() as connection:
+            requested = {station.canonical_entity_id(connection, identifier) for identifier in set(ids or [])}
         selected = sorted((product for product in products if product["id"] in requested), key=lambda product: product["id"], reverse=True)
         if len(selected) > 3:
             return page(request, "compare.html", title="产品对比", products=products, selected=[], rows=[], comparable=False, error_message="一次最多选择三款产品")
