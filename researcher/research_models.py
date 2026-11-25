@@ -214,7 +214,7 @@ class Finish(StrictModel):
 TOOLS = {
     "search_knowledge": (KnowledgeQuery, "检索本机保存的完整资料、历史证据及相关原文；返回带 chunk_id 的片段。"),
     "search_web": (WebQuery, "检索公开网络资料。使用明确查询，可含 site:、after:、before: 和英文产品名。每次检索消耗一次云端请求。"),
-    "read_source": (ReadSource, "读取原始网页、文本或文本型 PDF，保存原文版本并建立完整索引。"),
+    "read_source": (ReadSource, "读取原始网页、文本或文本型 PDF 并保存原文。remaining_web_pages 为 0 时，只能读取 reserved_web_urls 或本次前序搜索已计数的链接，例如尚待补全正文的摘要。"),
     "read_evidence": (ReadEvidence, "按给定 chunk_id 读取原文，检查详细条件或已存证据。"),
     "inspect_topic": (InspectTopic, "读取已有专题判断、支持和反对证据、相关事件与问题。"),
     "finish_research": (Finish, "证据足够或继续调查价值不足时结束探索；需要用户补充条件时填写 needs_input。"),

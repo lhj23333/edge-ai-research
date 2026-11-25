@@ -30,7 +30,7 @@ def cache_put(namespace, content_hash, value):
     db.execute("INSERT OR IGNORE INTO content_cache(content_hash,namespace,value) VALUES(?,?,?)", (content_hash, namespace, value))
 
 
-def evidence_hash(connection, kind, identifier):
+def evidence_hash(connection, kind, identifier, *, archive_versions=None):
     rows = connection.execute("""
         WITH event_ids(id) AS (
             SELECT ? WHERE ?='event'
@@ -45,16 +45,20 @@ def evidence_hash(connection, kind, identifier):
                   JOIN judgments j ON j.current_version_id=je.version_id WHERE ?='topic' AND j.topic_id=?
             UNION SELECT c.document_id FROM claims c JOIN knowledge_evidence ke ON ke.claim_id=c.id
                   JOIN knowledge_facets kf ON kf.item_id=ke.item_id WHERE ?='topic' AND kf.topic_id=?
+            UNION SELECT json_extract(value,'$[0]') FROM json_each(?)
         )
         SELECT d.id,v.content_hash,v.extent,v.verification,
                (SELECT json_group_array(id) FROM (
                     SELECT c.id FROM claims c WHERE c.document_id=d.id AND c.verification='人工核对发现不符' ORDER BY c.id
                )) AS disputed
         FROM documents d JOIN document_versions v ON v.document_id=d.id AND v.content_hash=d.content_hash
-        WHERE d.id IN (SELECT id FROM document_ids) OR NOT EXISTS(SELECT id FROM document_ids WHERE id IS NOT NULL)
+        WHERE d.id IN (SELECT id FROM document_ids)
+           OR (? AND NOT EXISTS(SELECT id FROM document_ids WHERE id IS NOT NULL))
         ORDER BY d.id
-    """, (identifier, kind, kind, identifier, kind, identifier, kind, identifier))
-    return digest([tuple(row) for row in rows])
+    """, (identifier, kind, kind, identifier, kind, identifier, kind, identifier,
+          encode(archive_versions or []), archive_versions is None))
+    documents = [tuple(row) for row in rows]
+    return digest(documents if archive_versions is None else [documents, archive_versions])
 
 
 def normalized(value):

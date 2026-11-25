@@ -35,6 +35,7 @@ class State(TypedDict, total=False):
     review_round: int
     degraded_reason: str
     degraded_detail: str
+    archive_evidence_hash: str | None
 
 
 def supported_knowledge(connection, result):
@@ -76,6 +77,7 @@ class ResearchRun:
         self.target_kind = self.job.get("target_kind", "topic" if self.job.get("topic_id") else None)
         self.target_id = self.job.get("target_id") or self.job.get("topic_id")
         self.evidence_hash = None
+        self.topic_archive = None
 
     def checkpoint(self, progress):
         if self.task.get("automatic"):
@@ -106,12 +108,15 @@ class ResearchRun:
         if (self.private or self.task["kind"] not in {"revise", "event_research"}
                 or self.target_kind not in {"topic", "event"} or not self.target_id):
             return None
+        if self.target_kind == "topic":
+            # 在数据库事务外更新索引，并让缓存检查与本次调查使用同一批候选。
+            self.topic_archive = self.load_archive()
         with db.open_database() as connection:
             connection.execute("BEGIN")
             return self.cached_evidence(connection)
 
     def cached_evidence(self, connection):
-        self.evidence_hash = continuity.evidence_hash(connection, self.target_kind, self.target_id)
+        self.evidence_hash = self.current_evidence_hash(connection)
         prior = connection.execute(
             "SELECT t.id,t.result_json FROM research_evidence_versions v JOIN tasks t ON t.id=v.task_id "
             "WHERE v.target_kind=? AND v.target_id=? AND v.request_hash=? AND v.evidence_hash=? AND t.status='success'",
@@ -124,6 +129,13 @@ class ResearchRun:
             return {**result, "evidence_hash": self.evidence_hash, "skipped_reason": "evidence_unchanged",
                     "reused_task_id": prior["id"], "changes": []}
         return None
+
+    def current_evidence_hash(self, connection):
+        versions = None
+        if self.topic_archive is not None:
+            versions = sorted({(item["document_id"], item["version_id"]) for chunk in self.topic_archive
+                               for item in (chunk, *chunk.get("same_content_sources", []))})
+        return continuity.evidence_hash(connection, self.target_kind, self.target_id, archive_versions=versions)
 
     def evidence_request(self):
         policy = {"cost_profile": self.cost_profile, "web_pages": self.cost.web_pages, "review_rounds": self.cost.review_rounds,
@@ -198,15 +210,23 @@ class ResearchRun:
                 context["trigger_event"] = db.one("SELECT id,title,event_type,what_happened,published_at,product_version,first_party_confirmed FROM events WHERE id=?", (self.event_id,))
         return context
 
+    def load_archive(self):
+        if self.job.get("chunk_ids"):
+            return [{**item, "chunk_id": item["id"]} for item in (knowledge.chunk_row(identifier) for identifier in self.job["chunk_ids"]) if item]
+        return knowledge.search(self.goal, self.config.context_chunks)
+
+    async def ranked_archive(self):
+        if self.topic_archive is not None:
+            return self.topic_archive
+        return await asyncio.to_thread(self.load_archive)
+
     async def recall(self, state):
         self.checkpoint("检索已有领域知识与完整原文")
-        chunks = await asyncio.to_thread(knowledge.search, self.goal)
-        if self.event_id:
+        chunks = await self.ranked_archive()
+        if self.event_id and not self.job.get("chunk_ids"):
             seed = knowledge.event_chunks(self.event_id, max(4, self.config.context_chunks // 2))
             present = {item["chunk_id"] for item in seed}
             chunks = (seed + [item for item in chunks if item["chunk_id"] not in present])[:self.config.context_chunks]
-        if self.job.get("chunk_ids"):
-            chunks = [{**item, "chunk_id": item["id"]} for item in (knowledge.chunk_row(identifier) for identifier in self.job["chunk_ids"]) if item]
         memory = await asyncio.to_thread(knowledge.context, self.goal)
         self.record("研究目标与已有知识", inputs={"goal": self.goal, "scope": self.scope}, outputs={"chunk_ids": [item["chunk_id"] for item in chunks], "knowledge_ids": [item["id"] for item in memory["knowledge"]], "prompt_version": self.prompt_version})
         self.record("原文索引", outputs={"chunks": db.one("SELECT count(*) AS n FROM document_chunks")["n"]})
@@ -216,11 +236,15 @@ class ResearchRun:
         if not self.can_read:
             context["mode"] = "仅整理本机已有证据，不使用联网工具；必须检查既有证据中的不同厂商与软件条件。"
         context["recent_searches"] = continuity.cache_candidates(self.task) if self.can_search else []
-        return {"messages": [{"role": "system", "content": PLANNING}, {"role": "user", "content": station.encode(context)}], "chunks": chunks, "memory": memory, "round": 0, "calls": [], "visited": [], "no_progress": 0, "errors": [], "finish": {}}
+        return {"messages": [{"role": "system", "content": PLANNING}, {"role": "user", "content": station.encode(context)}], "chunks": chunks, "memory": memory, "round": 0, "calls": [], "visited": [], "no_progress": 0, "errors": [], "finish": {}, "archive_evidence_hash": self.evidence_hash}
 
     def tool_allowed(self, name):
-        if name in {"search_web", "read_source"}:
-            return (self.can_search if name == "search_web" else self.can_read) and self.remaining_pages() > 0
+        if name == "search_web":
+            return self.can_search and self.remaining_pages() > 0
+        if name == "read_source":
+            return self.can_read and (self.remaining_pages() > 0 or db.one(
+                "SELECT 1 FROM research_operations WHERE task_id=? AND kind='web_page' LIMIT 1", (self.task["id"],),
+            ) is not None)
         return True
 
     def remaining_pages(self):
@@ -228,15 +252,16 @@ class ResearchRun:
         return max(0, self.cost.web_pages - used)
 
     def reserve_page(self, url):
-        key = "page:" + continuity.digest(continuity.canonical_url(url))
+        url = continuity.canonical_url(url)
+        key = "page:" + continuity.digest(url)
         with db.transaction() as connection:
             if connection.execute("SELECT id FROM research_operations WHERE task_id=? AND operation_key=?", (self.task["id"], key)).fetchone():
                 return True
             used = connection.execute("SELECT count(*) FROM research_operations WHERE task_id=? AND kind='web_page'", (self.task["id"],)).fetchone()[0]
             if used >= self.cost.web_pages:
                 return False
-            connection.execute("INSERT INTO research_operations(task_id,operation_key,kind,status,created_at,updated_at) "
-                               "VALUES(?,?,'web_page','success',?,?)", (self.task["id"], key, db.now(), db.now()))
+            connection.execute("INSERT INTO research_operations(task_id,operation_key,kind,status,inputs_json,created_at,updated_at) "
+                               "VALUES(?,?,'web_page','success',?,?,?)", (self.task["id"], key, station.encode({"url": url}), db.now(), db.now()))
             return True
 
     def planner_tools(self, definitions):
@@ -251,7 +276,15 @@ class ResearchRun:
         self.checkpoint(f"根据证据规划第 {state['round'] + 1} 轮调查")
         async def build():
             messages = list(state["messages"])
-            messages.append({"role": "user", "content": station.encode({"remaining_requests": self.gateway.remaining(), "reserved_final_requests": self.final_reserve, "round": state["round"] + 1, "unresolved_errors": state["errors"][-4:], "recent_searches": continuity.cache_candidates(self.task) if self.can_search else []})})
+            progress = {"remaining_requests": self.gateway.remaining(), "reserved_final_requests": self.final_reserve,
+                        "round": state["round"] + 1, "unresolved_errors": state["errors"][-4:],
+                        "recent_searches": continuity.cache_candidates(self.task) if self.tool_allowed("search_web") else []}
+            if self.can_read:
+                reservations = db.query("SELECT json_extract(inputs_json,'$.url') AS url FROM research_operations "
+                                        "WHERE task_id=? AND kind='web_page' ORDER BY id", (self.task["id"],))
+                progress["remaining_web_pages"] = max(0, self.cost.web_pages - len(reservations))
+                progress["reserved_web_urls"] = [row["url"] for row in reservations if row["url"]]
+            messages.append({"role": "user", "content": station.encode(progress)})
             return {"messages": messages, "tools": self.planner_tools(tool_definitions())}
         prepared = await self.prepare_request(request_key, build)
         messages = prepared["messages"]
@@ -322,7 +355,7 @@ class ResearchRun:
             db.execute("INSERT INTO research_experiences(query_key,query,scope_json,document_ids_json,last_result,last_used_at) VALUES(?,?,?,?,?,?) ON CONFLICT(query_key) DO UPDATE SET document_ids_json=excluded.document_ids_json,last_result=excluded.last_result,last_used_at=excluded.last_used_at", (query_key, arguments.query, station.encode(self.scope), station.encode(list(new_ids)), "检索取得资料" if sources else "本次查询未取得结果", db.now()))
         elif name == "read_source":
             if not self.reserve_page(arguments.url):
-                return {"error": "已达到本档位的网页检索上限", "signature": signature}
+                return {"error": "已达到本档位的网页检索上限，只能读取本次已计数的 URL", "signature": signature}
             result = await knowledge.fetch(arguments.url, self.task["id"], force=self.job.get("force_refresh", False))
             relevant = await asyncio.to_thread(knowledge.search, self.goal)
             selected = [item for item in relevant if item["document_id"] == result["document_id"]]
@@ -394,7 +427,7 @@ class ResearchRun:
                 "errors": errors, "finish": finish or ({"reason": degradation["degraded_detail"]} if degradation else {}), **degradation}
 
     async def synthesis_inputs(self, state):
-        ranked = await asyncio.to_thread(knowledge.search, self.goal, self.config.context_chunks)
+        ranked = await self.ranked_archive()
         candidates = {item["chunk_id"]: item for item in state["chunks"]}
         ordered = list(state["chunks"]) if self.job.get("chunk_ids") else [item for item in ranked if item["chunk_id"] in candidates]
         if self.event_id:
@@ -704,7 +737,7 @@ class ResearchRun:
                     and result.get("degraded_reason") in {None, "review_round_limit"}
                     and not result.get("needs_input")
                     and supported_knowledge(connection, result)
-                    and self.evidence_hash == continuity.evidence_hash(connection, self.target_kind, self.target_id)):
+                    and self.evidence_hash == self.current_evidence_hash(connection)):
                 connection.execute("INSERT INTO research_evidence_versions VALUES(?,?,?,?,?) "
                                    "ON CONFLICT(target_kind,target_id,request_hash) DO UPDATE SET evidence_hash=excluded.evidence_hash,task_id=excluded.task_id",
                                    (self.target_kind, self.target_id, self.evidence_request(), self.evidence_hash, self.task["id"]))
@@ -790,7 +823,7 @@ def route_review(state):
 
 async def perform(task):
     run = ResearchRun(task)
-    reused = run.unchanged_evidence()
+    reused = await asyncio.to_thread(run.unchanged_evidence)
     if reused:
         run.checkpoint("底层证据未变化，复用已有研究")
         if run.finish_result(reused, reused["answer"], verify_cached_evidence=True):
@@ -819,4 +852,7 @@ async def perform(task):
             previous_private = db.one("SELECT id FROM tasks WHERE session_id=? AND id<? AND json_array_length(job_json,'$.selected_note_ids')>0 LIMIT 1", (task["session_id"], task["id"]))
             if run.private or previous_private:
                 raise ResearchError("已有研究进度可能包含个人批注，请在会话中发起新一轮研究")
+        if snapshot.values and run.topic_archive is not None and snapshot.values.get("archive_evidence_hash") != run.evidence_hash:
+            # 恢复的研究仍使用已保存的原文，不能为新召回的归档证据写入缓存。
+            run.evidence_hash = None
         await graph.ainvoke(None if snapshot.values else {}, config, durability="sync")

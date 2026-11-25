@@ -77,6 +77,7 @@ def cost_profile_for_research(name="balanced", limit=None):
     save_profile(profile, secrets.token_urlsafe())
     config = settings()
     config.update(cost_profile=name)
+    config["research"]["device"] = "cpu"
     config["limits"]["daily_cost"] = limit
     write_json("config.json", config)
 
@@ -213,6 +214,60 @@ def test_unchanged_evidence_reuses_research_and_new_source_version_invalidates_i
     assert current.evidence_hash != hash_before
 
 
+def test_topic_cache_tracks_recalled_unlinked_archive_versions(topic, targeted_hailo):
+    cost_profile_for_research()
+    config = settings()
+    config["research"]["context_chunks"] = 4
+    write_json("config.json", config)
+    _, linked_document, _, chunk, _, _ = targeted_hailo
+    goal = "Hailo-10H edge AI accelerator M.2 module deployment and hardware specifications"
+    job = {**research.topic_job(topic), "main_question": goal}
+    materials = (
+        ("software", "The Hailo-10H edge AI accelerator runs generative AI models with the Hailo software suite."),
+        ("form-factor", "Hailo-10H M.2 modules are designed for edge AI accelerator deployments."),
+        ("hardware", "Hailo-10H offloads neural network inference from the host processor in edge AI systems."),
+    )
+    for name, text in materials:
+        station.save_document(Source("Hailo-10H " + name, f"https://hailo.ai/{name}", text, "文本原文"), None)
+
+    original_id = research.enqueue("revise", job)
+    original = ResearchRun(claim_task(True))
+    assert original.unchanged_evidence() is None
+    assert linked_document in {item["document_id"] for item in original.topic_archive}
+    asyncio.run(original.commit(hailo_review_state(chunk)))
+    original_hash = original.evidence_hash
+
+    unrelated, _ = station.save_document(Source("Bananas", "https://www.rhs.org.uk/plants/banana",
+                                               "Bananas ripen as the fruit releases ethylene gas. A paper bag keeps the gas around the fruit.", "文本原文"), None)
+    assert unrelated not in {item["document_id"] for item in knowledge.search(goal)}
+    reuse_id = research.enqueue("revise", job)
+    asyncio.run(perform(claim_task(True)))
+    reused = station.decode(db.one("SELECT result_json FROM tasks WHERE id=?", (reuse_id,))["result_json"])
+    assert reused["skipped_reason"] == "evidence_unchanged" and reused["reused_task_id"] == original_id
+    assert reused["evidence_hash"] == original_hash
+
+    related, version = station.save_document(Source("Hailo-10H edge AI accelerator M.2 module specifications",
+                                                    "https://hailo.ai/products/ai-accelerators/hailo-10h-m-2-module/",
+                                                    "The Hailo-10H edge AI accelerator is available as an M.2 module. Its deployment uses a host with a compatible M.2 slot.",
+                                                    "文本原文"), None)
+    assert not db.one("SELECT id FROM claims WHERE document_id=?", (related,))
+    assert (related, version) in {(item["document_id"], item["version_id"]) for item in knowledge.search(goal)}
+    rerun_id = research.enqueue("revise", job)
+    task = claim_task(True)
+    assert task["id"] == rerun_id
+    rerun = ResearchRun(task)
+    assert rerun.unchanged_evidence() is None
+    state = asyncio.run(rerun.recall({}))
+    assert state["archive_evidence_hash"] == rerun.evidence_hash
+    synthesized = asyncio.run(rerun.synthesis_inputs(state))
+    assert (related, version) in {(item["document_id"], item["version_id"]) for item in synthesized["chunks"]}
+    result = assert_research_restarts_at_planning(task)
+    assert result["evidence_hash"] != original_hash
+    assert related in result["inspected_document_ids"] and unrelated not in result["inspected_document_ids"]
+    recalled = db.one("SELECT outputs_json FROM task_steps WHERE task_id=? AND stage='研究目标与已有知识'", (rerun_id,))
+    assert version in {knowledge.chunk_row(identifier)["version_id"] for identifier in station.decode(recalled["outputs_json"])["chunk_ids"]}
+
+
 @pytest.mark.parametrize(("target_kind", "feedback_kind"), [("topic", "incorrect"), ("event", "outdated")])
 def test_feedback_invalidates_evidence_cache_without_document_changes(targeted_hailo, target_kind, feedback_kind):
     cost_profile_for_research()
@@ -242,7 +297,7 @@ def test_feedback_invalidates_evidence_cache_without_document_changes(targeted_h
     assert continuity.canonical_knowledge(item_id)["status"] == "needs_review"
     assert not db.query("SELECT task_id FROM research_evidence_versions")
     with db.open_database() as connection:
-        assert continuity.evidence_hash(connection, target_kind, original.target_id) == original.evidence_hash
+        assert original.current_evidence_hash(connection) == original.evidence_hash
 
     rerun_id = enqueue(target_kind)
     rerun_task = claim_task(True)

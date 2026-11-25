@@ -8,10 +8,11 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import httpx
 import pytest
 from tokenizers import Tokenizer
 
-from researcher import db, knowledge, research, station
+from researcher import continuity, db, knowledge, research, station
 from researcher.config import Profile, save_profile, settings, write_json
 from researcher.providers import Gateway, ResearchError, Source, YieldResearch
 from researcher.research_engine import ResearchRun
@@ -101,6 +102,76 @@ def test_search_registration_and_execution_follow_manual_permission(local_gatewa
     assert result["status"] == "no_results"
     assert received == ["/tools/search"]
     assert db.one("SELECT operation,status FROM usage WHERE task_id=?", (task_id,)) == {"operation": "search", "status": "success"}
+
+
+def test_research_at_page_cap_reads_all_counted_search_results(local_gateway, served_folder, tmp_path):
+    base_url, endpoints, received = local_gateway
+    configure_profile(base_url)
+    config = settings()
+    config["cost_profile"] = "eco"
+    config["research"]["device"] = "cpu"
+    write_json("config.json", config)
+    excerpts = (
+        "Hailo-10H is an edge AI accelerator. Product information includes support for generative AI models.",
+        "Hailo-10H is offered in an M.2 form factor. The host must provide a compatible slot.",
+        "Hailo-10H executes AI inference at the edge. The host application integrates with Hailo software.",
+        "Hailo-10H supports large language model inference. Deployment should follow the model and platform documentation.",
+        "Hailo-10H has an additional product document. The search did not select this resource.",
+    )
+    files = [tmp_path / f"hailo-{index}.txt" for index in range(len(excerpts))]
+    for path, body in zip(files, excerpts, strict=True):
+        path.write_text(body)
+    urls = [f"{served_folder}/{path.name}" for path in files]
+
+    def search_archive(request):
+        assert request["count"] == 4
+        return 200, {"results": [{"title": path.stem, "url": url, "summary": path.read_text().split(". ")[0]}
+                                 for path, url in zip(files[:4], urls[:4], strict=True)]}
+
+    endpoints["/tools/search"] = search_archive
+    task_id = research.enqueue("interactive", {"main_question": "核对 Hailo-10H 模块的部署条件"})
+    run = ResearchRun(claim_task(True))
+
+    def tool(name, identifier, **arguments):
+        return {"id": identifier, "function": {"name": name, "arguments": station.encode(arguments)}}
+
+    async def exercise():
+        state = {"visited": [], "messages": [], "round": 1, "no_progress": 0, "errors": []}
+        searched = await run.execute_tool(tool("search_web", "find", query="Hailo-10H"), state)
+        assert [item["url"] for item in searched["documents"]] == urls[:4]
+        assert {item["extent"] for item in searched["documents"]} == {"搜索摘要"}
+        assert run.remaining_pages() == 0
+        assert not run.tool_allowed("search_web") and run.tool_allowed("read_source")
+
+        config["limits"]["daily_cost"] = 0.000001
+        write_json("config.json", config)
+        assert (await run.plan(state))["degraded_reason"] == "cost_safety_limit"
+        planned = run.saved_request(f"planner:{run.prompt_version}:1")
+        plan_tools = {item["function"]["name"]: item["function"]["description"] for item in planned["tools"]}
+        assert "search_web" not in plan_tools and "reserved_web_urls" in plan_tools["read_source"]
+        progress = station.decode(planned["messages"][-1]["content"])
+        assert progress["remaining_web_pages"] == 0 and progress["reserved_web_urls"] == urls[:4]
+
+        async with httpx.AsyncClient(trust_env=False) as client:
+            for index, url in enumerate(urls[:4]):
+                # 用本地 HTTP 的真实归档填充读取缓存，保留运行时对私有地址的限制。
+                async def archive(_):
+                    resource = await knowledge.get_resource(client, url, allowed_hosts=("127.0.0.1",))
+                    document, version, _ = knowledge.archive_resource(resource, url, task_id)
+                    await asyncio.to_thread(knowledge.ensure_index, False, [version])
+                    return knowledge.source_result(document, version, url)
+
+                await continuity.cached_operation("read_source", {"url": url}, {}, task_id, archive)
+                fetched = await run.execute_tool(tool("read_source", f"read-{index}", url=url), state)
+                assert "原文" in fetched["extent"] and excerpts[index] in fetched["chunks"][0]["content"]
+
+        rejected = await run.execute_tool(tool("read_source", "new", url=urls[4]), state)
+        assert "只能读取本次已计数的 URL" in rejected["error"]
+        assert not continuity.document_for_url(urls[4]) and run.remaining_pages() == 0
+
+    asyncio.run(exercise())
+    assert received == ["/tools/search"]
+    assert len(db.query("SELECT id FROM research_operations WHERE task_id=? AND kind='web_page'", (task_id,))) == 4
 
 
 def test_private_note_turn_saves_only_task_and_session_result(client, csrf, topic):
