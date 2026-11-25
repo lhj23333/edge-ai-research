@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse
 from pydantic import ValidationError
 
-from . import continuity, db, research, station
+from . import continuity, db, knowledge as evidence_store, research, station
 from .config import ResearchSettings, config_lock, settings, write_json
 from .web_ids import RecordId, parse_record_id
 
@@ -28,7 +28,8 @@ def register(app, page, form_data, redirect, required, text):
     @router.post("/research")
     def create_research(form=Depends(form_data)):
         try:
-            task_id = research.enqueue("interactive", job_from_form(form))
+            job = job_from_form(form)
+            task_id = research.enqueue("interactive", job)
             task = db.one("SELECT session_id FROM tasks WHERE id=?", (task_id,))
             return redirect(f"/research/{task['session_id']}")
         except ValueError as error:
@@ -38,10 +39,21 @@ def register(app, page, form_data, redirect, required, text):
     def session_page(request: Request, session_id: RecordId):
         session = required("SELECT * FROM research_sessions WHERE id=?", (session_id,))
         task = db.one("SELECT * FROM tasks WHERE session_id=? ORDER BY id DESC LIMIT 1", (session_id,))
-        result = station.decode(task["result_json"]) if task else {}
-        identifiers = result.get("knowledge_ids", [])
+        result = (station.decode(task["result_json"]) or {}) if task else {}
+        identifiers = result.get("knowledge_ids") or []
         knowledge = list({item["id"]: item for item in (continuity.canonical_knowledge(identifier) for identifier in identifiers) if item}.values())
-        return page(request, "research_session.html", title=session["title"], session=session, task=task, result=result, knowledge=knowledge, messages=db.query("SELECT * FROM research_messages WHERE session_id=? ORDER BY id", (session_id,)), steps=db.query("SELECT * FROM task_steps WHERE task_id=? ORDER BY id", (task["id"],)) if task else [], calls=db.query("SELECT count(*) AS n,sum(input_tokens) AS inputs,sum(output_tokens) AS outputs FROM usage WHERE task_id=?", (task["id"],))[0] if task else {}, notes=db.query("SELECT id,body FROM annotations WHERE archived=0 ORDER BY id DESC LIMIT 50"), feedback=db.query("SELECT * FROM research_feedback WHERE session_id=? ORDER BY id DESC", (session_id,)), gaps=db.query("SELECT * FROM research_gaps WHERE origin_task_id IN (SELECT id FROM tasks WHERE session_id=?) ORDER BY priority DESC,id", (session_id,)))
+        feedback = db.query("SELECT * FROM research_feedback WHERE session_id=? ORDER BY id DESC", (session_id,))
+        for entry in feedback:
+            entry["item"] = continuity.canonical_knowledge(entry["item_id"]) if entry["item_id"] else None
+        citations = evidence_store.document_access(db.query("""
+            SELECT d.id AS document_id,d.title,d.url,v.id AS version_id,min(c.id) AS chunk_id
+            FROM tasks t JOIN json_each(t.result_json,'$.chunk_ids') j
+            JOIN document_chunks c ON c.id=j.value JOIN document_versions v ON v.id=c.version_id
+            JOIN documents d ON d.id=v.document_id
+            WHERE t.session_id=? GROUP BY d.id,v.id ORDER BY max(t.id) DESC,min(c.id)
+        """, (session_id,)))
+        return page(request, "research_session.html", title=session["title"], session=session, task=task, result=result, knowledge=knowledge, messages=db.query("SELECT * FROM research_messages WHERE session_id=? ORDER BY id", (session_id,)), steps=db.query("SELECT * FROM task_steps WHERE task_id=? ORDER BY id", (task["id"],)) if task else [], calls=db.query("SELECT count(*) AS n,sum(input_tokens) AS inputs,sum(output_tokens) AS outputs FROM usage WHERE task_id=?", (task["id"],))[0] if task else {}, notes=db.query("SELECT id,body FROM annotations WHERE archived=0 ORDER BY id DESC LIMIT 50"), feedback=feedback, gaps=db.query("SELECT * FROM research_gaps WHERE origin_task_id IN (SELECT id FROM tasks WHERE session_id=?) ORDER BY priority DESC,id", (session_id,)),
+                    citations=citations)
 
     @router.post("/research/{session_id}/messages")
     def continue_research(session_id: RecordId, form=Depends(form_data)):
@@ -67,7 +79,7 @@ def register(app, page, form_data, redirect, required, text):
         try:
             item_id = parse_record_id(form["item_id"]) if form.get("item_id") else None
             research.feedback(session_id, parse_record_id(form.get("task_id")), str(form.get("kind", "")), str(form.get("body", ""))[:2000], item_id)
-            return redirect(f"/research/{session_id}", "反馈已保存，相关知识的核验状态已更新")
+            return redirect(f"/research/{session_id}", "反馈已保存")
         except (ValueError, TypeError) as error:
             return redirect(f"/research/{session_id}", error=str(error))
 
@@ -100,14 +112,12 @@ def register(app, page, form_data, redirect, required, text):
     @router.post("/settings/research")
     def save_research_settings(form=Depends(form_data)):
         try:
-            previous = settings()["research"]
-            values = {key: form.get(key, value) for key, value in previous.items()}
-            if "event_research_setting" in form:
-                values["automatic_event_research"] = form.get("automatic_event_research") == "yes"
-            config = ResearchSettings(**values)
             with config_lock():
                 saved = settings()
-                saved["research"] = config.model_dump()
+                values = {key: form.get(key, value) for key, value in saved["research"].items()}
+                if "event_research_setting" in form:
+                    values["automatic_event_research"] = form.get("automatic_event_research") == "yes"
+                saved["research"] = ResearchSettings(**values).model_dump()
                 write_json("config.json", saved)
             return redirect("/settings#research", "研究额度与本地检索设置已保存")
         except ValidationError:

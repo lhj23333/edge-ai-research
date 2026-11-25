@@ -9,6 +9,7 @@
 </div>
 <label>API 基础地址<input class="mono" type="url" name="base_url" value="{{ profile.base_url if profile else presets.qwen.base_url }}" required maxlength="500" placeholder="https://…"></label>
 <label>模型或推理接入点名称<input class="mono" name="model" value="{{ profile.model if profile else presets.qwen.model }}" required maxlength="120" placeholder="填写账户中已开通的模型名称"></label>
+<label>模型层级<select name="tier">{% for key,label in model_tiers.items() %}<option value="{{ key }}" {{ 'selected' if key == (profile.tier if profile else 'primary') }}>{{ label }}</option>{% endfor %}</select></label>
 <label>连接测试的默认思考强度<select name="reasoning_effort">{% for value,label in [('low','低（默认）'),('high','高'),('max','最高'),('disabled','关闭思考'),('default','服务商默认')] %}<option value="{{ value }}" {{ 'selected' if (profile.reasoning_effort if profile else 'low')==value else '' }}>{{ label }}</option>{% endfor %}</select><small>可在步骤路由中指定各步骤的思考强度。</small></label>
 <label>API 密钥{% if profile %}<small>留空保留已有密钥</small>{% endif %}<input type="password" name="api_key" autocomplete="new-password" maxlength="2000" {{ 'required' if not profile else '' }} placeholder="仅保存在本机服务端"></label>
 <details><summary>token 费用估算（可选）</summary><p class="muted">以人民币填写输入、输出和搜索单价。联网生成同时计入两类费用。</p><div class="field-row"><label>输入单价 / 百万 token<input name="input_price" type="number" step="any" min="0" value="{{ profile.input_price if profile and profile.input_price is not none else '' }}"></label><label>输出单价 / 百万 token<input name="output_price" type="number" step="any" min="0" value="{{ profile.output_price if profile and profile.output_price is not none else '' }}"></label></div><label>搜索单价 / 次<input name="search_price" type="number" step="any" min="0" value="{{ profile.search_price if profile and profile.search_price is not none else '' }}"></label><label>价格来源及确认日期<input name="price_note" maxlength="300" value="{{ profile.price_note if profile else '' }}" placeholder="服务商价格页链接、确认日期"></label></details>
@@ -19,6 +20,17 @@
 
 <div class="layout-split">
   <div class="stack">
+    <section class="panel">
+      <div class="panel-head"><h2>{{ icon('sliders') }}运行档位</h2></div>
+      <form action="/settings" method="post" class="stack-form">{{ token() }}<input type="hidden" name="section" value="cost">
+        {% for key,policy in cost_profiles.items() %}
+        <label class="check-row"><input type="radio" name="cost_profile" value="{{ key }}" {{ 'checked' if key == config.cost_profile }}>
+          {{ policy.label }}{% if key == 'balanced' %}（默认）{% endif %} · 最多 {{ policy.web_pages }} 个网页、{{ policy.review_rounds }} 轮审阅 · {{ '可用模型润色简报' if policy.polish_briefing else '规则生成简报' }}</label>
+        {% endfor %}
+        <p class="field-help">各步骤优先使用对应层级中已通过连接测试的模型。只配置一个模型时，档位通过思考强度、输出上限和检索数量调整用量。</p>
+        <button class="button primary" type="submit">保存档位</button>
+      </form>
+    </section>
     <section class="panel">
       <div class="panel-head"><h2>{{ icon('spark') }}模型配置</h2><span class="badge">{{ icon('lock') }}服务端保存密钥</span></div>
       <p class="panel-note">每个模型分别完成连接与联网测试。修改地址、模型或密钥后，验证状态会清除。</p>
@@ -47,29 +59,43 @@
       <p class="field-help section-space">测试会实际调用云端 API，并计入调用额度。对话接口兼容不代表具备联网能力，联网测试必须取得来源。</p>
     </section>
 
-    <section class="panel" id="routes">
-      <div class="panel-head"><h2>{{ icon('sliders') }}模型步骤路由</h2></div>
-      <form action="/settings/routes" method="post" class="stack-form">{{ token() }}
-        {% set names={'prefilter':'预筛','score':'双评','write':'事件摘要','cluster':'事件关系判定','cluster_review':'存疑复核','deep_plan':'深研规划与整理','deep_review':'深研证据核验'} %}
+    <details class="panel" id="routes"><summary>高级设置</summary>
+      <form action="/settings" method="post" class="stack-form section-space">{{ token() }}<input type="hidden" name="section" value="limits">
+        <h3>每日／每月总费用安全红线</h3>
+        <div class="field-row">{% for key,label in [('daily_cost','每日'),('monthly_cost','每月')] %}<label>{{ label }}总费用（元）<input name="{{ key }}" type="number" min="0.000001" step="any" value="{{ config.limits[key] if config.limits[key] is not none else '' }}" placeholder="留空停用"></label>{% endfor %}</div>
+        <small class="field-help">按 {{ config.limits.timezone }} 的自然日和自然月统计。启用后，调用前按模型单价预留费用。触及红线时，深研保存已有结果。</small>
+        <button class="button" type="submit">保存费用红线</button>
+      </form>
+      <form action="/settings" method="post" class="stack-form section-space">{{ token() }}<input type="hidden" name="section" value="cost">
+        <label>简报润色<select name="briefing_polish">
+          <option value="" {{ 'selected' if config.briefing_polish is none }}>随运行档位</option>
+          <option value="true" {{ 'selected' if config.briefing_polish is sameas true }}>开启模型润色</option>
+          <option value="false" {{ 'selected' if config.briefing_polish is sameas false }}>仅用规则模板</option>
+        </select></label>
+        <button class="button" type="submit">保存简报设置</button>
+      </form>
+      <form action="/settings" method="post" class="stack-form section-space">{{ token() }}<input type="hidden" name="section" value="routes">
+        <h3>模型槽位覆盖</h3>
+        <input type="hidden" name="override_switches" value="yes">
         {% set efforts=[('disabled','关闭'),('low','低'),('high','高'),('max','最高'),('default','服务商默认')] %}
         {% for route in routes %}<div class="form-section">
-          <h3 class="form-section-title">{{ names[route.step] }} <small class="mono">{{ route.step }}</small></h3>
+          <label class="check-row"><input type="checkbox" name="{{ route.step }}_enabled" value="yes" {{ 'checked' if route['values'].get('enabled', route['values']|length > 0) }}>
+            覆盖{{ step_labels[route.step] }}（{{ route.step }}）</label>
           <div class="field-row">
-            <label>模型配置<select name="{{ route.step }}_profile_id"><option value="">使用当前模型</option>{% for profile in config.profiles %}<option value="{{ profile.id }}" {{ 'selected' if route['values'].get('profile_id')==profile.id }}>{{ profile.name }} · {{ profile.model }}</option>{% endfor %}</select></label>
+            <label>模型配置<select name="{{ route.step }}_profile_id"><option value="">档位默认（{{ route.tier }}）</option>{% for profile in config.profiles %}<option value="{{ profile.id }}" {{ 'selected' if route['values'].get('profile_id')==profile.id }}>{{ profile.name }} · {{ profile.model }}</option>{% endfor %}</select></label>
             <label>思考强度<select name="{{ route.step }}_reasoning_effort"><option value="">步骤默认（{{ dict(efforts)[route.effort] }}）</option>{% for key,label in efforts %}<option value="{{ key }}" {{ 'selected' if route['values'].get('reasoning_effort')==key }}>{{ label }}</option>{% endfor %}</select></label>
             <label>输出 token 上限<input name="{{ route.step }}_output_tokens" type="number" min="128" max="32768" value="{{ route['values'].get('output_tokens','') }}" placeholder="{{ route.tokens }}"></label>
           </div>
           {% set used=(route_usage|default({})).get(route.step, {}) %}<small class="meta">今日 {{ used.get('requests', 0) }} 次 · 输入 {{ used.get('input_tokens', 0) }} / 输出 {{ used.get('output_tokens', 0) }} token · {{ '¥ %.5f'|format(used.estimate) if used.get('estimate') is not none else '费用待估算' }}</small>
         </div>{% endfor %}
-        <button class="button primary" type="submit">保存步骤路由</button>
+        <button class="button primary" type="submit">保存模型槽位</button>
       </form>
-    </section>
+    </details>
 
     <section class="panel" id="research">
       <div class="panel-head"><h2>{{ icon('search') }}研究与知识积累</h2></div>
       <form action="/settings/research" method="post" class="stack-form section-space">{{ token() }}
-        <div class="field-row">{% for key,label,minimum,maximum in [('ingest_requests','单次漏斗或评测任务请求上限',4,100),('question_requests','交互与定向研究请求上限',4,100),('revise_requests','知识整理请求上限',3,100),('onboard_requests','候选名单请求上限',4,100),('followup_requests','后续研究请求上限',4,100),('automatic_daily_requests','自动任务每日请求上限',0,10000),('followups_per_day','每日可自动核验的事件数',0,20),('max_rounds','每次调查最多轮数',1,30),('timeout_minutes','每次调查最多分钟',1,120),('context_chunks','每轮整理最多原文片段',4,40),('source_fresh_days','已取资料有效天数',1,90),('query_cache_hours','相同查询复用小时数',1,24)] %}<label>{{ label }}<input name="{{ key }}" type="number" min="{{ minimum }}" max="{{ maximum }}" value="{{ config.research[key] }}" required></label>{% endfor %}</div>
-        <p class="field-help">相同范围和条件的查询默认在6小时内复用。选择“检查最新资料”会主动检查来源变化；内容未变化时继续使用已有原文和核验结果。</p>
+        <p class="field-help">专题整理与事件核验会复用证据版本相同的研究结果。探索研究可主动检查最新资料。</p>
         <input type="hidden" name="event_research_setting" value="yes">
         <label class="check-row"><input type="checkbox" name="automatic_event_research" value="yes" {{ 'checked' if config.research.automatic_event_research }}>允许在自动轮询期间核验达到行业门槛的 T1 事件</label>
         <details><summary>本地知识检索模型</summary><div class="stack-form"><label>执行设备<input name="device" value="{{ config.research.device }}" pattern="cpu|cuda:[0-9]+" required></label><label>语义检索模型<input name="embedding_model" value="{{ config.research.embedding_model }}" required></label><label>排序模型<input name="reranker_model" value="{{ config.research.reranker_model }}" required></label><p class="field-help">修改模型后运行模型准备和索引重建命令。设备不可用时会显示错误，需要选择有效设备。</p><pre><code>.venv/bin/researcher prepare-models
@@ -92,18 +118,6 @@ systemctl --user enable --now researcher-web researcher-worker</code></pre>
   </div>
 
   <aside class="stack">
-    <section class="panel">
-      <div class="panel-head"><h2>{{ icon('sliders') }}调用额度</h2></div>
-      <p class="panel-note">所有测试、手动与定时任务共同使用每日额度。每次重试也计为一次请求。</p>
-      <form action="/settings/limits" method="post" class="stack-form section-space">{{ token() }}
-        <label>每日最多 API 请求<input name="daily_requests" type="number" min="1" max="10000" value="{{ config.limits.daily_requests }}" required></label>
-        <label>连接测试请求上限<input name="task_requests" type="number" min="2" max="100" value="{{ config.limits.task_requests }}" required></label>
-        <label>一般回答与连接测试输出 token 上限<input name="output_tokens" type="number" min="256" max="32768" value="{{ config.limits.output_tokens }}" required></label>
-        {% for key,label in [('minute_cost','每分钟'),('hour_cost','每小时'),('daily_cost','每日')] %}<label>{{ label }}费用上限（元）<input name="{{ key }}" type="number" min="0.000001" step="any" value="{{ config.limits[key] if config.limits[key] is not none else '' }}" placeholder="留空表示未设置"></label>{% endfor %}
-        <small class="field-help">每日额度按 {{ config.limits.timezone }} 计算。费用上限按提交前预估与已返回用量核算。</small>
-        <button class="button" type="submit">{{ icon('check') }}保存调用额度</button>
-      </form>
-    </section>
     <section class="panel">
       <div class="panel-head"><h2>{{ icon('bars') }}今日用量</h2><span class="mono panel-note">{{ usage.requests }} / {{ config.limits.daily_requests }}</span></div>
       {{ bar(usage.requests, config.limits.daily_requests, 'warning' if usage.requests >= config.limits.daily_requests * 0.8 else 'accent') }}

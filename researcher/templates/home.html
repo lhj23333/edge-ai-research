@@ -8,6 +8,7 @@
   <a class="button primary" href="/updates">查看全部动态{{ icon('arrow-right') }}</a>
 {% endcall %}
 
+{% if polished_briefing %}<section class="panel section-space"><h2>简报概览</h2><p>{{ polished_briefing }}</p></section>{% endif %}
 <section class="status-strip" aria-label="采集状态">
   <div class="status-cell">
     <span class="status-label">{{ icon('refresh') }}更新方式</span>

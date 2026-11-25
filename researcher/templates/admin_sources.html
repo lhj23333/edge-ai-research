@@ -8,7 +8,7 @@
 <div class="layout-split">
   <div class="stack">
     {% if preview_rows is not none %}<section class="panel" id="preview"><div class="panel-head"><h2>预览结果</h2><span class="panel-note">{{ preview_rows|length }} 条</span></div><div class="list">
-      {% for row in preview_rows %}<article class="list-item"><a href="{{ row.url }}" target="_blank" rel="noopener noreferrer">{{ row.title }}</a><small>{{ row.published_at|localtime if row.published_at else '发布日期未确认' }} · {{ states[row.state] }}{% if row.gate_reason %} · {{ reasons.get(row.gate_reason, row.gate_reason) }}{% endif %}{% if row.error %} · {{ row.error }}{% endif %}</small></article>
+      {% for row in preview_rows %}<article class="list-item" data-date-status="{{ row.date_status }}"><a href="{{ row.url }}" target="_blank" rel="noopener noreferrer">{{ row.title }}</a><small>{{ row.published_at|localtime if row.published_at else '发布日期未确认' }} · {{ states[row.state] }}{% if row.gate_reason %} · {{ reasons.get(row.gate_reason, row.gate_reason) }}{% endif %}</small>{% if row.error %}<small class="tone-warning">{{ row.error }}</small>{% endif %}</article>
       {% else %}<p class="muted">当前配置没有匹配的条目。</p>{% endfor %}
     </div></section>{% endif %}
     <section class="panel"><div class="panel-head"><h2>{{ '已归档信源' if archived else '受控信源' }}</h2>

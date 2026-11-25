@@ -13,6 +13,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from jinja2 import DictLoader
 from markdown_it import MarkdownIt
 from markupsafe import Markup
 from pydantic import ValidationError
@@ -20,14 +21,24 @@ from sse_starlette.sse import EventSourceResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from . import __version__, db, research
-from .config import MODEL_STEPS, PRESETS, Limits, Profile, config_lock, describe_routes, get_profile, model_routes, save_profile, settings, write_json
+from .config import COST_PROFILES, MODEL_STEPS, MODEL_TIERS, PRESETS, STEP_LABELS, CostSettings, Limits, Profile, config_lock, describe_routes, get_profile, model_routes, save_profile, settings, write_json
 from .service import KINDS, STATES, enqueue_test, save_artifact, task_documents, usage_summary
 from .scheduler import next_topic_run, pause_topic_schedule
 from .web_ids import RecordId, parse_record_id
 
 HERE = Path(__file__).parent
 STARTED_AT = datetime.now(timezone.utc).isoformat(timespec="seconds")
-templates = Jinja2Templates(directory=str(HERE / "templates"))
+
+
+def load_templates(directory):
+    renderer = Jinja2Templates(directory=directory)
+    loader = renderer.env.loader
+    # 固定本次启动读取的模板，防止运行中的进程读取下一版本的页面和宏。
+    renderer.env.loader = DictLoader({name: loader.get_source(renderer.env, name)[0] for name in loader.list_templates()})
+    return renderer
+
+
+templates = load_templates(HERE / "templates")
 markdown = MarkdownIt("commonmark", {"html": False}).enable("table")
 
 
@@ -177,8 +188,10 @@ def worker_alive():
 
 
 def page(request, name, **values):
+    if "config" not in values:
+        values["config"] = settings()
     return templates.TemplateResponse(request=request, name=name, context={
-        "config": settings(), "worker_alive": worker_alive(),
+        "worker_alive": worker_alive(),
         "csrf": request.state.csrf, "notice": request.query_params.get("notice"),
         "error": request.query_params.get("error"), "path": request.url.path, "nav": navigation(request.url.path), **values,
     })
@@ -186,7 +199,8 @@ def page(request, name, **values):
 
 def redirect(path, notice=None, error=None):
     if notice or error:
-        path += ("&" if "?" in path else "?") + urlencode({"error" if error else "notice": error or notice})
+        url, separator, fragment = path.partition("#")
+        path = url + ("&" if "?" in url else "?") + urlencode({"error" if error else "notice": error or notice}) + separator + fragment
     return RedirectResponse(path, status_code=303)
 
 
@@ -415,6 +429,8 @@ def cancel_task(task_id: RecordId, form=Depends(form_data)):
     with db.transaction() as connection:
         connection.execute("UPDATE tasks SET cancel_requested=1 WHERE id=? AND status IN ('queued','running')", (task_id,))
         connection.execute("UPDATE tasks SET status='cancelled',progress='已取消',finished_at=? WHERE id=? AND status='queued'", (db.now(), task_id))
+        connection.execute("UPDATE topic_retry_quotas SET status='finished' WHERE task_id=? AND status='active' "
+                           "AND EXISTS(SELECT 1 FROM tasks WHERE id=? AND status='cancelled')", (task_id, task_id))
         if task["status"] == "queued" and task["session_id"]:
             connection.execute("UPDATE research_sessions SET status='cancelled',updated_at=? WHERE id=?", (db.now(), task["session_id"]))
     if task["status"] == "queued" and task["session_id"]:
@@ -423,17 +439,24 @@ def cancel_task(task_id: RecordId, form=Depends(form_data)):
     return redirect(f"/tasks/{task_id}", "已提交取消请求")
 
 
+@app.get("/setting", include_in_schema=False)
+def setting_alias(request: Request):
+    return RedirectResponse(request.url.replace(path="/settings"), status_code=308)
+
+
 @app.get("/settings", response_class=HTMLResponse)
 def settings_page(request: Request):
-    return page(request, "settings.html", title="模型与运行设置", usage=usage_summary(),
-                routes=list(describe_routes(settings())), route_usage={row["route"]: row for row in usage_summary(by_route=True)})
+    config = settings()
+    return page(request, "settings.html", title="模型与运行设置", config=config, usage=usage_summary(),
+                cost_profiles=COST_PROFILES, model_tiers=MODEL_TIERS, step_labels=STEP_LABELS,
+                routes=list(describe_routes(config)), route_usage={row["route"]: row for row in usage_summary(by_route=True)})
 
 
 @app.post("/settings/profiles")
 def profile_save(form=Depends(form_data)):
     try:
         profile_id = str(form.get("id") or secrets.token_hex(8))
-        profile = Profile(id=profile_id, name=text(form, "name", 80), provider=text(form, "provider", 30), base_url=text(form, "base_url", 500), model=text(form, "model", 120), reasoning_effort=str(form.get("reasoning_effort", "low")), input_price=float(form["input_price"]) if form.get("input_price") else None, output_price=float(form["output_price"]) if form.get("output_price") else None, price_note=str(form.get("price_note", "")), search_price=float(form["search_price"]) if form.get("search_price") else None)
+        profile = Profile(id=profile_id, name=text(form, "name", 80), provider=text(form, "provider", 30), base_url=text(form, "base_url", 500), model=text(form, "model", 120), tier=form.get("tier", "primary"), reasoning_effort=str(form.get("reasoning_effort", "low")), input_price=float(form["input_price"]) if form.get("input_price") else None, output_price=float(form["output_price"]) if form.get("output_price") else None, price_note=str(form.get("price_note", "")), search_price=float(form["search_price"]) if form.get("search_price") else None)
         key = str(form.get("api_key", "")).strip()
         if len(key) > 2000 or "\n" in key or "\r" in key:
             raise ValueError("API 密钥格式无效")
@@ -470,20 +493,36 @@ def test_profile(form=Depends(form_data)):
         return redirect("/settings", error=str(error))
 
 
+@app.post("/settings/cost")
+def save_cost_profile(form=Depends(form_data)):
+    try:
+        with config_lock():
+            config = settings()
+            polish = (form.get("briefing_polish") or None) if "briefing_polish" in form else config["briefing_polish"]
+            options = CostSettings(cost_profile=form.get("cost_profile", config["cost_profile"]), briefing_polish=polish)
+            config.update(options.model_dump())
+            write_json("config.json", config)
+        return redirect("/settings", "运行档位已保存")
+    except ValidationError:
+        return redirect("/settings", error="请选择有效的运行档位与简报选项")
+
+
 @app.post("/settings/limits")
 def limits_save(form=Depends(form_data)):
     try:
         with config_lock():
             config = settings()
-            values = {key: form.get(key, config["limits"][key]) for key in ("daily_requests", "task_requests", "output_tokens", "timezone")}
-            values.update({key: form.get(key) or None if key in form else config["limits"][key] for key in ("minute_cost", "hour_cost", "daily_cost")})
+            values = {key: form.get(key, value) for key, value in config["limits"].items()}
+            for key in ("daily_cost", "monthly_cost"):
+                if key in form:
+                    values[key] = str(form[key]).strip() or None
             config["limits"] = Limits(**values).model_dump()
             write_json("config.json", config)
         return redirect("/settings", "调用额度已保存，后续任务使用新设置")
     except ValidationError as error:
         if any(issue["loc"] == ("timezone",) for issue in error.errors(include_input=False)):
             return redirect("/settings", error="时区无效，请填写有效的 IANA 时区名称")
-        return redirect("/settings", error="额度格式无效，请填写页面允许范围内的整数")
+        return redirect("/settings", error="额度格式无效，请检查请求次数与全局费用红线")
 
 
 @app.post("/settings/routes")
@@ -494,6 +533,8 @@ def save_routes(form=Depends(form_data)):
             entries = {}
             for step in MODEL_STEPS:
                 fields = {key: form.get(f"{step}_{key}") or None for key in ("profile_id", "reasoning_effort", "output_tokens")}
+                if "override_switches" in form:
+                    fields["enabled"] = f"{step}_enabled" in form
                 if fields["profile_id"]:
                     get_profile(fields["profile_id"], config)
                 entries[step] = fields
@@ -504,6 +545,15 @@ def save_routes(form=Depends(form_data)):
         return redirect("/settings#routes", error="请检查步骤的模型、思考强度与输出上限")
     except ValueError as error:
         return redirect("/settings#routes", error=str(error))
+
+
+@app.post("/settings")
+def settings_save(form=Depends(form_data)):
+    handlers = {"cost": save_cost_profile, "limits": limits_save, "routes": save_routes}
+    handler = handlers.get(form.get("section"))
+    if handler is None:
+        return redirect("/settings", error="请选择要保存的设置")
+    return handler(form)
 
 
 @app.get("/health")

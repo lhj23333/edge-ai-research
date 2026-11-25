@@ -9,7 +9,7 @@ from ..config import settings
 from ..industry import selection
 from ..providers import BudgetExceeded, Cancelled, ResearchError, yield_to_manual
 from . import briefing, health
-from .collectors import collect, ensure_catalog, push_entries, source_config, stamp
+from .collectors import collect, ensure_catalog, parse_date, push_entries, source_config, stamp
 from .funnel import ITEM_ERRORS, item_failure, process_item
 from .gate import ELIGIBLE_SOURCE, observe, processing_source
 
@@ -18,6 +18,7 @@ READY_ITEMS = """
    AND (i.next_attempt_at IS NULL OR i.next_attempt_at<=?)
    AND EXISTS (SELECT 1 FROM feed_sources s WHERE
 """ + ELIGIBLE_SOURCE + ")"
+ARCHIVE_REASONS = {"initial_backfill", "expired", "before_backfill_window", "published_after"}
 
 
 def due_sources(checked):
@@ -149,21 +150,54 @@ def needs_selection_retry(item, policy):
     return item["state"] == "scored_out" and item["manual_score"] is not None and item["manual_score"] >= policy.threshold(item["tier"], item["category"])
 
 
-def retry_item(item_id):
-    from .cluster import update_event
+def record_review(connection, item_id, action, reason, *, score=None, event_id=None):
+    connection.execute("INSERT INTO feed_manual_reviews(item_id,action,reason,score,event_id,created_at) VALUES(?,?,?,?,?,?)",
+                       (item_id, action, reason, score, event_id, db.now(timespec="microseconds")))
+
+
+def can_release(item):
+    return item["state"] == "gated_archive" or (item["state"] == "scored_out" and item["gate_reason"] in ARCHIVE_REASONS)
+
+
+def retry_item(item_id, reason="", *, release=False):
+    from .cluster import assignment_reason, move_assignment, update_event
     policy = selection()
     request_limit = settings()["research"]["ingest_requests"]
     with db.transaction() as connection:
         item = connection.execute("SELECT * FROM feed_items WHERE id=?", (item_id,)).fetchone()
-        if not item or item["state"] not in {"pending_date", "discovered", "selected", "scored_out"} or not processing_source(connection, item_id):
+        if not item or item["state"] not in {"pending_date", "discovered", "selected", "scored_out", "gated_archive"}:
             raise ValueError("该条目当前无法继续处理")
-        if item["state"] == "scored_out" and not needs_selection_retry(item, policy):
-            raise ValueError("更正后的评分需要达到入选门槛")
-        if item["state"] == "scored_out":
-            connection.execute("UPDATE feed_items SET state=?,event_visible_at=? WHERE id=?",
-                               ("clustered" if item["event_id"] else "selected", db.now(timespec="microseconds") if item["event_id"] else None, item_id))
+        releasing = can_release(item)
+        if release and not releasing:
+            raise ValueError("该条目已经送回评估或无需人工放行")
+        if not processing_source(connection, item_id, releasing=releasing):
+            raise ValueError("该条目没有可处理的已启用信源")
+        now = datetime.now(timezone.utc)
+        published = parse_date(item["published_at"])
+        ready_date = published is not None and published <= now
+        if item["state"] == "gated_archive" or release:
+            if not reason.strip():
+                raise ValueError("请填写送回评估的理由")
+            record_review(connection, item_id, "release", reason)
+            connection.execute("UPDATE feed_items SET state=?,gate_reason='',manual_release=1,manual_score=NULL,manual_reason='' WHERE id=?",
+                               ("discovered" if ready_date else "pending_date", item_id))
+        elif item["state"] == "scored_out":
+            if not needs_selection_retry(item, policy):
+                raise ValueError("更正后的评分需要达到入选门槛")
+            state = "clustered" if item["event_id"] else "selected" if ready_date else "pending_date"
+            if releasing:
+                record_review(connection, item_id, "release", reason or item["manual_reason"])
+            connection.execute("UPDATE feed_items SET state=?,event_visible_at=?,manual_release=max(manual_release,?),gate_reason='' WHERE id=?",
+                               (state, db.now(timespec="microseconds") if item["event_id"] else None, int(releasing), item_id))
             if item["event_id"]:
-                update_event(connection, item["event_id"], datetime.now(timezone.utc), policy)
+                if item["manual_target_event_id"] and item["manual_target_event_id"] != item["event_id"]:
+                    target = connection.execute("SELECT * FROM events WHERE id=? AND state='active' AND canonical_event_id IS NULL",
+                                                (item["manual_target_event_id"],)).fetchone()
+                    if not target:
+                        raise ValueError("人工指定的目标事件已失效，请重新指定归属")
+                    move_assignment(connection, item, target, assignment_reason(connection, item_id), now, policy)
+                else:
+                    update_event(connection, item["event_id"], now, policy)
         connection.execute("UPDATE research_operations SET status='retry_authorized',updated_at=? WHERE status IN ('unknown','running','invalid','truncated','failed') "
                            "AND EXISTS (SELECT 1 FROM item_evaluations e WHERE e.item_id=? AND e.status IN ('failed','unknown') AND e.task_id=research_operations.task_id AND research_operations.operation_key='feed:'||e.id)", (db.now(), item_id))
         connection.execute("UPDATE item_evaluations SET status='pending',reason='',updated_at=? WHERE item_id=? AND status IN ('failed','unknown')", (db.now(), item_id))
@@ -225,6 +259,7 @@ async def perform(task):
                     f"条目 #{item_id} 已完成本次处理。" if not incomplete else "", error, db.now(), db.now(), task_id))
         return
     issue = briefing.compose()
+    await briefing.polish(task_id, issue)
     summary = f"信源检查成功 {len(success)} 项，失败 {len(failures)} 项。新增条目 {sum(run['new_count'] for run in runs)} 条。今日简报有 {len(issue['events'])} 件事件。"
     if errors:
         summary += f" {errors} 条资料待继续处理。"

@@ -1,5 +1,17 @@
 {% from 'macros.html' import token with context %}
 {% from 'ui.html' import icon %}
+{% macro source_access(source) %}
+  {% if source.fetch_error %}<small class="tone-warning">上次获取外部原文失败（{{ source.fetch_error }}，{{ source.fetch_failed_at|localtime }}），请优先查看本地归档。</small>
+  {% elif source.external_checked_at %}<small>外部原文上次获取成功于 {{ source.external_checked_at|localtime }}。</small>{% endif %}
+  {% if source.has_snapshot %}<small>已保留原始快照。</small>{% endif %}
+{% endmacro %}
+{% macro archive_links(source, document_id, version_id=none, chunk_id=none) %}
+  <div class="actions">
+    <a href="/documents/{{ document_id }}{% if version_id %}?version={{ version_id }}{% endif %}{% if chunk_id %}#chunk-{{ chunk_id }}{% endif %}">本地归档原文</a>
+    <a href="{{ source.url }}" target="_blank" rel="noopener noreferrer">外部原文链接{{ icon('external') }}</a>
+  </div>
+  {{ source_access(source) }}
+{% endmacro %}
 {% macro annotation_form(kind,identifier) %}
 <details class="panel annotation-panel">
   <summary>{{ icon('note') }}写个人批注</summary>
@@ -31,8 +43,8 @@
   <p class="evidence-statement">{{ claim.statement }}</p>
   <blockquote class="excerpt">{{ claim.excerpt }}</blockquote>
   <div class="evidence-source">
-    <a href="/documents/{{ claim.document_id }}">{{ icon('evidence') }}<span>{{ claim.document_title }}</span></a>
-    <a href="{{ claim.url }}" target="_blank" rel="noopener noreferrer">来源链接{{ icon('external') }}</a>
+    <strong>{{ claim.document_title }}</strong>
+    {{ archive_links(claim, claim.document_id, claim.document_version_id, claim.source_chunk_id) }}
   </div>
   <dl class="fact-grid fact-grid-inline">
     <div><dt>发布日期</dt><dd class="mono">{{ claim.published_at or '来源未提供' }}</dd></div>

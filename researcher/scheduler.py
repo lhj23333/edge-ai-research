@@ -2,8 +2,8 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from . import db, research
-from .config import Limits, settings
-from .providers import cost_windows
+from .config import COST_PROFILES, Limits, settings
+from .providers import cost_windows, topic_calls
 
 
 def next_run(clock, zone, after=None):
@@ -28,19 +28,40 @@ def pause_topic_schedule(connection, topic_id):
     for task in queued:
         connection.execute("UPDATE tasks SET status='cancelled',finished_at=?,progress='计划已停用' WHERE id=?", (timestamp, task["id"]))
         connection.execute("UPDATE research_sessions SET status='cancelled',updated_at=? WHERE id=?", (timestamp, task["session_id"]))
+        connection.execute("UPDATE topic_retry_quotas SET status='finished' WHERE task_id=? AND status='active'", (task["id"],))
+
+
+def release_expired(checked):
+    if not db.one("SELECT task_id FROM topic_retry_quotas WHERE status='active' AND auto_released_at<=? "
+                  "UNION ALL SELECT id FROM usage WHERE status='reserved' AND auto_released_at<=? LIMIT 1", (checked, checked)):
+        return
+    with db.transaction() as connection:
+        connection.execute("UPDATE research_operations SET status='unknown',updated_at=? WHERE status='running' AND EXISTS "
+                           "(SELECT 1 FROM usage u WHERE u.task_id=research_operations.task_id AND u.request_key=research_operations.operation_key "
+                           "AND u.status='reserved' AND u.auto_released_at<=?)", (checked, checked))
+        connection.execute("UPDATE usage SET status='unknown' WHERE status='reserved' AND auto_released_at<=?", (checked,))
+        expired = connection.execute("UPDATE topic_retry_quotas SET status='expired' WHERE status='active' AND auto_released_at<=? "
+                                     "RETURNING task_id", (checked,)).fetchall()
+        for row in expired:
+            task = connection.execute("UPDATE tasks SET status='interrupted',finished_at=?,progress='定时研究等待超时' "
+                                      "WHERE id=? AND status='queued' RETURNING session_id", (checked, row["task_id"])).fetchone()
+            if task:
+                connection.execute("UPDATE research_sessions SET status='interrupted',updated_at=? WHERE id=?",
+                                   (checked, task["session_id"]))
 
 
 def tick():
     from .ingest import briefing, health, jobs
+    checked = db.now()
+    release_expired(checked)
     station = db.one("SELECT * FROM station_settings WHERE id=1")
     if not station["auto_enabled"]:
         return
-    checked = db.now()
     if not db.one("SELECT id FROM tasks WHERE kind='feed' AND status IN ('queued','running') LIMIT 1") and jobs.has_work(checked):
         jobs.enqueue(automatic=True)
     if station["next_run"] and station["next_run"] <= checked:
         health.refresh()
-        briefing.compose()
+        briefing.enqueue_polish(briefing.compose())
         following = next_run(station["schedule_time"], settings()["limits"]["timezone"])
         db.execute("UPDATE station_settings SET next_run=? WHERE id=1", (following,))
     try:
@@ -58,6 +79,7 @@ def schedule_directed_research():
     config = settings()
     limits = Limits(**config["limits"])
     policy = config["research"]
+    cost = COST_PROFILES[config["cost_profile"]]
     current = datetime.now(timezone.utc)
     checked = current.isoformat(timespec="seconds")
     local = current.astimezone(ZoneInfo(limits.timezone))
@@ -92,15 +114,16 @@ def schedule_directed_research():
 
         used = connection.execute("SELECT count(*) AS total,coalesce(sum(t.automatic),0) AS automatic FROM usage u JOIN tasks t ON t.id=u.task_id WHERE u.day=?", (day,)).fetchone()
         remaining = min(limits.daily_requests - used["total"], policy["automatic_daily_requests"] - used["automatic"])
-        if any(spent >= limit for _, limit, spent in cost_windows(connection, limits, current, day)):
-            return
-        if gap and followups < policy["followups_per_day"] and remaining >= policy["followup_requests"]:
+        redline = any(spent >= limit for _, limit, spent in cost_windows(connection, limits, day))
+        if gap and not redline and followups < policy["followups_per_day"] and remaining >= policy["followup_requests"]:
             research.enqueue_gap(gap, connection, automatic=True)
-        elif plan and remaining >= policy["revise_requests"]:
+        elif plan and remaining > 0 and topic_calls(connection, day) < cost.daily_topic_calls:
             job = research.topic_job(plan)
-            job["main_question"] = f"基于本机已归档资料，检查《{plan['title']}》的行业竞争和部署决策是否需要更新。研究范围：{plan['question']}"
-            research.enqueue("revise", job, schedule_key=f"topic-revision:{plan['id']}:{plan['next_run']}",
-                             automatic=True, connection=connection)
+            task_id = research.enqueue("revise", job, schedule_key=f"topic-revision:{plan['id']}:{plan['next_run']}",
+                                       automatic=True, connection=connection)
+            expires = (current + timedelta(minutes=policy["timeout_minutes"])).isoformat(timespec="seconds")
+            connection.execute("INSERT OR IGNORE INTO topic_retry_quotas(task_id,topic_id,auto_released_at) VALUES(?,?,?)",
+                               (task_id, plan["id"], expires))
             following = next_topic_run(plan["frequency"], plan["schedule_time"], plan["weekday"], limits.timezone, current)
             connection.execute("UPDATE topic_research_schedules SET next_run=? WHERE topic_id=?", (following, plan["id"]))
         else:
@@ -111,7 +134,7 @@ def schedule_directed_research():
 def schedule_event_research():
     from . import station
     from .industry import selection
-    from .research import enqueue_event
+    from .research import enqueue_event, event_schedule_key
     config = settings()
     research = config["research"]
     if not research["automatic_event_research"] or db.one("SELECT id FROM tasks WHERE status IN ('queued','running') LIMIT 1"):
@@ -129,16 +152,20 @@ def schedule_event_research():
         return
     policy = selection()
     since = (current - timedelta(hours=policy.freshness_hours)).isoformat(timespec="seconds")
-    candidate = db.one("SELECT e.id FROM events e JOIN feed_items i ON i.event_id=e.id WHERE i.state='clustered' AND i.tier='T1' "
-                       "AND i.published_at>=? AND coalesce(i.manual_score,i.score)>=? AND e.state='active' AND e.canonical_event_id IS NULL "
-                       "AND e.event_type IN (SELECT value FROM json_each(?)) "
-                       "AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.kind='event_research' AND json_extract(t.job_json,'$.target_id')=e.id) "
-                       "ORDER BY coalesce(i.manual_score,i.score) DESC,e.heat_score DESC,e.id DESC LIMIT 1",
-                       (since, policy.auto_research_score, station.encode(policy.auto_research_types)))
-    if candidate:
-        try:
-            enqueue_event(candidate["id"], automatic=True)
-        except ValueError as error:
-            record_error(error)
-        else:
-            db.execute("DELETE FROM runtime WHERE name='scheduler_error'")
+    with db.open_database() as connection:
+        candidates = connection.execute("SELECT e.id FROM events e JOIN feed_items i ON i.event_id=e.id WHERE i.state='clustered' AND i.tier='T1' "
+                                        "AND i.published_at>=? AND coalesce(i.manual_score,i.score)>=? AND e.state='active' AND e.canonical_event_id IS NULL "
+                                        "AND e.event_type IN (SELECT value FROM json_each(?)) "
+                                        "GROUP BY e.id ORDER BY max(coalesce(i.manual_score,i.score)) DESC,e.heat_score DESC,e.id DESC",
+                                        (since, policy.auto_research_score, station.encode(policy.auto_research_types))).fetchall()
+        for candidate in candidates:
+            key = event_schedule_key(connection, candidate["id"])
+            if connection.execute("SELECT id FROM tasks WHERE schedule_key=?", (key,)).fetchone():
+                continue
+            try:
+                enqueue_event(candidate["id"], automatic=True, schedule_key=key)
+            except ValueError as error:
+                record_error(error)
+            else:
+                db.execute("DELETE FROM runtime WHERE name='scheduler_error'")
+            return

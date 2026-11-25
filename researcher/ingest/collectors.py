@@ -23,8 +23,9 @@ ACCEPT = {
     "web_list": "text/html,application/xhtml+xml",
     "json_list": "application/json",
 }
-DATE_PROBE_BYTES = 128 * 1024
-DATE_PROBE_SECONDS = 5
+DATE_PROBE_BYTES = 512 * 1024
+DATE_PROBE_SECONDS = 12
+COMMON_DATE_FORMATS = ("%Y/%m/%d", "%Y.%m.%d", "%Y年%m月%d日", "%B %d, %Y", "%b %d, %Y", "%d %B %Y")
 SOURCE_HAS_HISTORY = """(
  EXISTS(SELECT 1 FROM feed_runs r WHERE r.source_id=s.id) OR
  EXISTS(SELECT 1 FROM feed_items i WHERE i.source_id=s.id) OR
@@ -121,18 +122,29 @@ def parse_date(value, zone="UTC", format_string=""):
     if not isinstance(value, str) or not value.strip():
         return None
     value = value.strip()
-    try:
-        if format_string:
-            parsed = datetime.strptime(value, format_string)
-        elif len(value) == 10:
-            parsed = datetime.combine(date.fromisoformat(value), time.min)
-        else:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
+    if format_string:
         try:
-            parsed = parsedate_to_datetime(value)
-        except (ValueError, TypeError, OverflowError):
-            return None
+            return utc_date(datetime.strptime(value, format_string), zone)
+        except ValueError:
+            pass
+    try:
+        parsed = datetime.combine(date.fromisoformat(value), time.min) if len(value) == 10 else datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return utc_date(parsed, zone)
+    except ValueError:
+        pass
+    try:
+        return utc_date(parsedate_to_datetime(value), zone)
+    except (ValueError, TypeError, OverflowError):
+        pass
+    for pattern in COMMON_DATE_FORMATS:
+        try:
+            return utc_date(datetime.strptime(value, pattern), zone)
+        except ValueError:
+            continue
+    return None
+
+
+def utc_date(parsed, zone):
     return parsed.replace(tzinfo=parsed.tzinfo or ZoneInfo(zone)).astimezone(timezone.utc)
 
 
@@ -251,7 +263,7 @@ def selected_node(node, selector):
 
 
 def node_value(node, attr=""):
-    return ((node.get(attr) if attr else None) or node.text_content()) if node is not None else ""
+    return ((node.get(attr) if attr else None) or node.get("content") or node.text_content()) if node is not None else ""
 
 
 def web_entries(body, options):
@@ -348,8 +360,9 @@ def structured_dates(value):
     if isinstance(value, dict):
         if value.get("datePublished"):
             yield value["datePublished"]
-        if "@graph" in value:
-            yield from structured_dates(value["@graph"])
+        for key in ("@graph", "mainEntity"):
+            if key in value:
+                yield from structured_dates(value[key])
     elif isinstance(value, list):
         for element in value:
             yield from structured_dates(element)
@@ -360,16 +373,22 @@ def detail_date(resource, source):
         return None
     root = html.fromstring(resource.body)
     options = source.options
-    values = root.xpath("//meta[@property='article:published_time' or @itemprop='datePublished']/@content | //time[@itemprop='datePublished']/@datetime")
+    values = root.xpath("//meta[@property='article:published_time' or @itemprop='datePublished' "
+                        "or @name='pubdate' or @name='datePublished' or @name='publish-date']/@content")
+    times = [node for node in root.cssselect("time[datetime]") if node.get("itemprop") != "dateModified"
+             and not {"updated", "modified", "date-modified"}.intersection(node.classes)]
+    values.extend(node.get("datetime") for node in times if node.get("itemprop") == "datePublished" or "published" in node.classes)
     if options.detail_date:
-        values.insert(0, node_value(selected_node(root, options.detail_date), options.date_attribute))
-    for script in root.xpath("//script[@type='application/ld+json']/text()"):
+        values[:0] = [node_value(node, options.date_attribute) for node in root.cssselect(options.detail_date)]
+    for script in root.xpath("//script[starts-with(@type,'application/ld+json')]/text()"):
         try:
             values.extend(structured_dates(json.loads(script)))
         except json.JSONDecodeError:
             continue
     for value in values:
-        published = parse_date(value, options.date_timezone) or parse_date(value, options.date_timezone, options.date_format)
+        published = parse_date(value, options.date_timezone, options.date_format)
         if published:
             return published
-    return None
+    # 普通 time 元素仅在候选日期一致时使用，避免把更新日期、评论时间误认为发布时间。
+    dates = {parsed for node in times if (parsed := parse_date(node.get("datetime"), options.date_timezone, options.date_format))}
+    return next(iter(dates)) if len(dates) == 1 else None

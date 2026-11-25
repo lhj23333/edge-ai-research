@@ -17,6 +17,46 @@ def digest(value):
     return hashlib.sha256(encode(value).encode()).hexdigest()
 
 
+def text_hash(value):
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def cache_get(namespace, content_hash):
+    row = db.one("SELECT value FROM content_cache WHERE namespace=? AND content_hash=?", (namespace, content_hash))
+    return row["value"] if row else None
+
+
+def cache_put(namespace, content_hash, value):
+    db.execute("INSERT OR IGNORE INTO content_cache(content_hash,namespace,value) VALUES(?,?,?)", (content_hash, namespace, value))
+
+
+def evidence_hash(connection, kind, identifier):
+    rows = connection.execute("""
+        WITH event_ids(id) AS (
+            SELECT ? WHERE ?='event'
+            UNION SELECT event_id FROM event_topics WHERE ?='topic' AND topic_id=?
+        ), document_ids(id) AS (
+            SELECT e.representative_document_id FROM events e JOIN event_ids i ON i.id=e.id WHERE e.state='active'
+            UNION SELECT f.document_id FROM feed_items f JOIN event_ids i ON i.id=f.event_id
+                  JOIN events e ON e.id=i.id WHERE e.state='active' AND f.state='clustered'
+            UNION SELECT c.document_id FROM claims c JOIN event_claims ec ON ec.claim_id=c.id
+                  JOIN event_ids i ON i.id=ec.event_id JOIN events e ON e.id=i.id WHERE e.state='active'
+            UNION SELECT c.document_id FROM claims c JOIN judgment_evidence je ON je.claim_id=c.id
+                  JOIN judgments j ON j.current_version_id=je.version_id WHERE ?='topic' AND j.topic_id=?
+            UNION SELECT c.document_id FROM claims c JOIN knowledge_evidence ke ON ke.claim_id=c.id
+                  JOIN knowledge_facets kf ON kf.item_id=ke.item_id WHERE ?='topic' AND kf.topic_id=?
+        )
+        SELECT d.id,v.content_hash,v.extent,v.verification,
+               (SELECT json_group_array(id) FROM (
+                    SELECT c.id FROM claims c WHERE c.document_id=d.id AND c.verification='人工核对发现不符' ORDER BY c.id
+               )) AS disputed
+        FROM documents d JOIN document_versions v ON v.document_id=d.id AND v.content_hash=d.content_hash
+        WHERE d.id IN (SELECT id FROM document_ids) OR NOT EXISTS(SELECT id FROM document_ids WHERE id IS NOT NULL)
+        ORDER BY d.id
+    """, (identifier, kind, kind, identifier, kind, identifier, kind, identifier))
+    return digest([tuple(row) for row in rows])
+
+
 def normalized(value):
     return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
 

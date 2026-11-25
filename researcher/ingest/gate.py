@@ -1,4 +1,5 @@
 import asyncio
+import re
 from calendar import monthrange
 from datetime import datetime, timedelta, timezone
 
@@ -10,18 +11,47 @@ from ..industry import selection
 from ..providers import ResearchError
 from .collectors import article_date, collect, matches_prefix, parse_date, push_entries, source_config, stamp
 
+PREVIEW_DATE_CONCURRENCY = 5
+BODY_GATE_LABELS = {"empty_body": "缺少可提取的正文", "link_only": "仅包含跳转链接",
+                    "short_body": "正文过短", "low_information": "正文信息密度过低"}
+LINK = re.compile(r"https?://[^\s<>)]+", re.IGNORECASE)
+NAVIGATION = re.compile(r"点击|点此|查看|阅读|访问|参见|详见|原文|详情|全文|更多|这里|此处|原始链接|read more|click here|visit website", re.IGNORECASE)
+
+
+def body_gate(content):
+    body = content.strip()
+    if not body:
+        return "empty_body"
+    prose = LINK.sub("", body)
+    if prose != body and not any(character.isalnum() for character in NAVIGATION.sub("", prose)):
+        return "link_only"
+    characters = [character.casefold() for character in prose if character.isalnum()]
+    if len(characters) < 70:
+        return "short_body"
+    tokens = re.findall(r"[a-z0-9]+|[\u3400-\u9fff]", prose.casefold())
+    if len(set(characters)) < 12 or (len(tokens) > 12 and len(set(tokens)) / len(tokens) < 0.18):
+        return "low_information"
+    return ""
+
+
+def fetch_error(error):
+    if isinstance(error, httpx.HTTPStatusError):
+        return f"HTTP {error.response.status_code}"
+    return str(error) if isinstance(error, ResearchError) else type(error).__name__
+
 
 OBSERVED_SOURCE = """
  s.enabled=1 AND s.archived_at IS NULL AND s.id IN (
    SELECT i.source_id UNION ALL SELECT o.source_id FROM feed_observations o WHERE o.item_id=i.id
  )
 """
-ELIGIBLE_SOURCE = OBSERVED_SOURCE + " AND (s.published_after IS NULL OR i.published_at IS NULL OR i.published_at>s.published_after)"
+ELIGIBLE_SOURCE = OBSERVED_SOURCE + " AND (i.manual_release=1 OR s.published_after IS NULL OR i.published_at IS NULL OR i.published_at>s.published_after)"
 
 
-def processing_source(connection, item_id):
+def processing_source(connection, item_id, *, releasing=False):
     return connection.execute("SELECT s.* FROM feed_items i CROSS JOIN feed_sources s WHERE i.id=? AND "
-                              + ELIGIBLE_SOURCE + " ORDER BY (s.id=i.source_id) DESC,s.id LIMIT 1", (item_id,)).fetchone()
+                              + (OBSERVED_SOURCE if releasing else ELIGIBLE_SOURCE)
+                              + " ORDER BY (s.id=i.source_id) DESC,s.id LIMIT 1", (item_id,)).fetchone()
 
 
 def archive_cutoff(now, months):
@@ -47,6 +77,8 @@ def gate_date(published, discovered, checked, published_after, is_backfill, poli
 
 
 def publication_state(connection, item, published, checked, policy):
+    if item["manual_release"] and published and published <= checked:
+        return "discovered", ""
     cutoff = connection.execute("SELECT CASE WHEN count(*)=count(s.published_after) THEN min(s.published_after) END "
                                 "FROM feed_items i CROSS JOIN feed_sources s WHERE i.id=? AND "
                                 + OBSERVED_SOURCE, (item["id"],)).fetchone()[0]
@@ -128,7 +160,8 @@ def observe(connection, source, entries, checked, policy):
             new += 1
             eligible += state == "discovered"
         connection.execute("INSERT OR IGNORE INTO feed_observations(source_id,item_id,seen_at) VALUES(?,?,?)", (source["id"], item_id, timestamp))
-        if existing and (existing["state"] == "pending_date" or existing["gate_reason"] == "published_after"):
+        if existing and (existing["state"] == "pending_date" or
+                         (existing["state"] == "gated_archive" and existing["gate_reason"] == "published_after")):
             published = parse_date(existing["published_at"]) or entry.published_at
             state, reason = publication_state(connection, existing, published, checked, policy)
             published_at = stamp(published) if published else None
@@ -145,17 +178,18 @@ async def preview(source, payload=None, current=None):
     cursor = station.decode(current["cursor_json"]) if current else {}
     first = not cursor.get("baseline_at")
     excluded = set(cursor.get("backfill_excluded", ()))
-    async with httpx.AsyncClient(timeout=httpx.Timeout(15, connect=5), follow_redirects=False, trust_env=False) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(15, connect=10), follow_redirects=False, trust_env=False) as client:
         if source.kind == "external":
             entries = push_entries(payload, source)
         else:
             _, entries = await collect(client, source)
-        semaphore = asyncio.Semaphore(4)
+        semaphore = asyncio.Semaphore(PREVIEW_DATE_CONCURRENCY)
 
         async def inspect(entry):
             canonical = continuity.canonical_url(entry.url)
             published = entry.published_at
             error = ""
+            date_status = "confirmed" if published else "not_checked"
             with db.open_database() as connection:
                 document = known_document(connection, canonical, entry.url)
                 existing = existing_item(connection, canonical, document)
@@ -164,15 +198,22 @@ async def preview(source, payload=None, current=None):
             elif document:
                 state, reason = "duplicate", "historical_document"
                 published = parse_date(document["published_at"]) or published
+                date_status = "confirmed" if published else "not_checked"
             else:
-                try:
-                    if not published:
+                if not published:
+                    try:
                         async with semaphore:
                             published = await article_date(client, source, entry.url)
-                except (httpx.HTTPError, OSError, ValueError, etree.LxmlError, ResearchError) as exc:
-                    error = str(exc) if isinstance(exc, ResearchError) else type(exc).__name__
+                    except (httpx.HTTPError, OSError, ResearchError) as exc:
+                        date_status, error = "detail_request_failed", "详情页读取失败（" + fetch_error(exc) + "）"
+                    except (ValueError, etree.LxmlError) as exc:
+                        date_status, error = "date_not_found", f"详情页已读取，无法解析日期（{type(exc).__name__}），请检查 detail_date 或 date_format"
+                    else:
+                        date_status = "confirmed" if published else "date_not_found"
+                        if not published:
+                            error = "详情页已读取，未找到有效发布日期，请检查 detail_date 或 date_format"
                 state, reason = gate_date(published, checked, checked, parse_date(source.published_after), first, policy)
             return {"url": canonical, "title": entry.title, "published_at": stamp(published) if published else None,
-                    "state": state, "gate_reason": reason, "error": error}
+                    "state": state, "gate_reason": reason, "date_status": date_status, "error": error}
 
         return await asyncio.gather(*(inspect(entry) for entry in entries[:20]))

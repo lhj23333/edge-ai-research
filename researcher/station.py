@@ -1,6 +1,8 @@
 import hashlib
 import json
 import re
+import unicodedata
+from contextlib import nullcontext
 
 from . import db
 from .industry import selection
@@ -121,18 +123,136 @@ def save_claim(document_id, version_id, statement, excerpt, label, *, manual_exc
         return claim_id
 
 
-def entity(kind, name, state="active", parent_id=None, summary=""):
+def product_model(name):
+    value = normalized(unicodedata.normalize("NFKC", name))
+    value = re.sub(r"[‐‑–—]", "-", value)
+    value = re.sub(r"[\s-]+(?:dnpu|npu|soc|chip)$", "", value)
+    match = re.fullmatch(r"([a-z]{2,24})(?:[ -]([a-z]{1,8}))?[ -]?(\d+[a-z0-9]*)", value)
+    if not match:
+        return None
+    prefix, series, model = match.groups()
+    return prefix + (series or ""), model
+
+
+def canonical_entity_id(connection, identifier):
+    row = connection.execute("SELECT coalesce(canonical_entity_id,id) FROM entities WHERE id=?", (identifier,)).fetchone()
+    return row[0] if row else None
+
+
+def product_owners(connection, item):
+    owners = {row[0] for row in connection.execute(
+        "SELECT r.from_entity_id FROM relations r JOIN entities e ON e.id=r.from_entity_id "
+        "WHERE r.to_entity_id=? AND r.relation_type='提供产品' AND e.kind='厂商'", (item["id"],))}
+    if item["parent_id"] is not None:
+        owners.add(item["parent_id"])
+    return owners
+
+
+def entity(kind, name, state="active", parent_id=None, summary="", *, connection=None):
     if kind not in ENTITY_KINDS or not name.strip():
         raise ValueError("研究对象类别或名称无效")
     key = normalized(name)
     timestamp = db.now()
-    with db.transaction() as connection:
+    with (db.transaction() if connection is None else nullcontext(connection)) as connection:
+        if parent_id is not None:
+            parent_id = canonical_entity_id(connection, parent_id)
+        if kind == "产品":
+            exact = connection.execute("SELECT id FROM entities WHERE kind='产品' AND normalized_name=?", (key,)).fetchone()
+            alias = connection.execute("SELECT entity_id FROM entity_aliases WHERE normalized_name=?", (key,)).fetchone()
+            if exact or alias:
+                identifier = canonical_entity_id(connection, (exact or alias)[0])
+                connection.execute("UPDATE entities SET updated_at=?,parent_id=coalesce(parent_id,?) WHERE id=?",
+                                   (timestamp, parent_id, identifier))
+                return identifier
+            model = product_model(name)
+            if model:
+                candidates = [row for row in connection.execute("SELECT * FROM entities WHERE kind='产品' AND canonical_entity_id IS NULL AND state!='archived'")
+                              if product_model(row["name"]) == model]
+                if len(candidates) == 1:
+                    candidate = candidates[0]
+                    owners = product_owners(connection, candidate) | ({parent_id} if parent_id else set())
+                    if len(owners) <= 1:
+                        connection.execute("INSERT INTO entity_aliases(normalized_name,name,entity_id) VALUES(?,?,?)",
+                                           (key, name.strip(), candidate["id"]))
+                        connection.execute("UPDATE entities SET updated_at=?,parent_id=coalesce(parent_id,?) WHERE id=?",
+                                           (timestamp, parent_id, candidate["id"]))
+                        return candidate["id"]
         connection.execute(
             "INSERT INTO entities(kind,name,normalized_name,summary,parent_id,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?) "
             "ON CONFLICT(kind,normalized_name) DO UPDATE SET updated_at=excluded.updated_at",
             (kind, name.strip(), key, summary, parent_id, state, timestamp, timestamp),
         )
         return connection.execute("SELECT id FROM entities WHERE kind=? AND normalized_name=?", (kind, key)).fetchone()[0]
+
+
+def merge_product(connection, duplicate_id, target_id):
+    duplicate_id, target_id = (canonical_entity_id(connection, identifier) for identifier in (duplicate_id, target_id))
+    if not duplicate_id or not target_id or duplicate_id == target_id:
+        raise ValueError("请选择两条不同的产品记录")
+    duplicate, target = (connection.execute("SELECT * FROM entities WHERE id=? AND kind='产品'", (identifier,)).fetchone()
+                         for identifier in (duplicate_id, target_id))
+    if not duplicate or not target or target["state"] == "archived":
+        raise ValueError("归并目标必须是未归档的产品")
+    owners = product_owners(connection, duplicate) | product_owners(connection, target)
+    if len(owners) > 1:
+        raise ValueError("两条记录的归属厂商不同或存疑")
+    models = [product_model(row["name"]) for row in (duplicate, target)]
+    if all(models) and models[0][0] == models[1][0] and models[0] != models[1]:
+        raise ValueError("同一型号前缀下的产品代号不同，无法归并")
+
+    connection.execute("""INSERT OR IGNORE INTO entity_claims(entity_id,claim_id)
+                           SELECT ?,claim_id FROM (
+                             SELECT claim_id FROM entity_claims WHERE entity_id=?
+                             UNION SELECT claim_id FROM entity_fields WHERE entity_id=?
+                             UNION SELECT claim_id FROM relations WHERE from_entity_id=? OR to_entity_id=?
+                           ) WHERE claim_id IS NOT NULL""",
+                       (target_id, duplicate_id, duplicate_id, duplicate_id, duplicate_id))
+    connection.execute("""INSERT INTO entity_fields(entity_id,field_name,value,claim_id,updated_at)
+                           SELECT ?,field_name,value,claim_id,updated_at FROM entity_fields WHERE entity_id=?
+                           ON CONFLICT(entity_id,field_name,value) DO UPDATE
+                           SET claim_id=coalesce(entity_fields.claim_id,excluded.claim_id)""", (target_id, duplicate_id))
+    connection.execute("""WITH moved AS (
+                             SELECT CASE WHEN from_entity_id=:old THEN :target ELSE from_entity_id END AS a,
+                                    CASE WHEN to_entity_id=:old THEN :target ELSE to_entity_id END AS b,
+                                    relation_type,explanation,claim_id,created_at
+                             FROM relations WHERE from_entity_id=:old OR to_entity_id=:old
+                           ) INSERT INTO relations(from_entity_id,to_entity_id,relation_type,explanation,claim_id,created_at)
+                           SELECT a,b,relation_type,explanation,claim_id,created_at FROM moved WHERE a!=b
+                           ON CONFLICT(from_entity_id,to_entity_id,relation_type) DO UPDATE
+                           SET claim_id=coalesce(relations.claim_id,excluded.claim_id)""", {"old": duplicate_id, "target": target_id})
+    connection.execute("""INSERT INTO event_entities(event_id,entity_id,feed_only)
+                           SELECT event_id,?,feed_only FROM event_entities WHERE entity_id=?
+                           ON CONFLICT(event_id,entity_id) DO UPDATE SET feed_only=min(feed_only,excluded.feed_only)""",
+                       (target_id, duplicate_id))
+    for table in ("entity_claims", "entity_fields", "event_entities"):
+        connection.execute(f"DELETE FROM {table} WHERE entity_id=?", (duplicate_id,))
+    connection.execute("DELETE FROM relations WHERE from_entity_id=? OR to_entity_id=?", (duplicate_id, duplicate_id))
+    for table, column in (("entities", "parent_id"), ("feed_sources", "owner_entity_id"), ("feed_items", "owner_entity_id"),
+                          ("knowledge_items", "entity_id"), ("knowledge_facets", "entity_id"), ("entity_aliases", "entity_id"),
+                          ("entities", "canonical_entity_id")):
+        connection.execute(f"UPDATE {table} SET {column}=? WHERE {column}=?", (target_id, duplicate_id))
+    connection.execute("UPDATE annotations SET target_id=? WHERE target_kind='entity' AND target_id=?", (target_id, duplicate_id))
+    connection.execute("INSERT INTO entity_aliases(normalized_name,name,entity_id) VALUES(?,?,?) "
+                       "ON CONFLICT(normalized_name) DO UPDATE SET entity_id=excluded.entity_id", (duplicate["normalized_name"], duplicate["name"], target_id))
+    connection.execute("UPDATE entities SET state='archived',followed=0,canonical_entity_id=?,updated_at=? WHERE id=?",
+                       (target_id, db.now(), duplicate_id))
+    connection.execute("""UPDATE entities SET followed=max(followed,?),parent_id=coalesce(?,nullif(parent_id,id)),
+                           state=CASE WHEN ?='active' THEN 'active' ELSE state END,
+                           summary=CASE WHEN summary='' THEN ? ELSE summary END,updated_at=? WHERE id=?""",
+                       (duplicate["followed"], next(iter(owners), None), duplicate["state"], duplicate["summary"], db.now(), target_id))
+    return target_id
+
+
+def merge_existing_product_aliases(connection):
+    groups = {}
+    for item in connection.execute("SELECT * FROM entities WHERE kind='产品' AND state!='archived' ORDER BY length(normalized_name),id"):
+        model = product_model(item["name"])
+        if model:
+            groups.setdefault(model, []).append(item)
+    for items in groups.values():
+        if len(items) > 1 and len(set().union(*(product_owners(connection, item) for item in items))) <= 1:
+            for duplicate in items[1:]:
+                merge_product(connection, duplicate["id"], items[0]["id"])
 
 
 def add_event(item, claim_ids, entity_ids, topic_ids, existing_event_id=None):
@@ -171,6 +291,7 @@ def add_event(item, claim_ids, entity_ids, topic_ids, existing_event_id=None):
         for claim_id in claim_ids:
             connection.execute("INSERT OR IGNORE INTO event_claims(event_id,claim_id) VALUES(?,?)", (event_id, claim_id))
         for entity_id in entity_ids:
+            entity_id = canonical_entity_id(connection, entity_id) or entity_id
             connection.execute("INSERT INTO event_entities(event_id,entity_id) VALUES(?,?) "
                                "ON CONFLICT(event_id,entity_id) DO UPDATE SET feed_only=0 WHERE event_entities.feed_only=1", (event_id, entity_id))
         for topic_id in topic_ids:

@@ -12,20 +12,22 @@ from pydantic import Field, TypeAdapter, ValidationError
 from .. import db, station
 from ..industry import selection
 from ..providers import ResearchError
+from ..config import MODEL_STEPS, STEP_LABELS, settings
 from ..web_ids import OptionalRecordId, RecordId, parse_record_id
 from . import benchmark, jobs
 from .cluster import correct_assignment, update_event
 from .collectors import SOURCE_HAS_HISTORY, FeedConfig, change_source_lifecycle, ensure_catalog, save_source, source_config
 from .funnel import ITEM_ERRORS
-from .gate import preview
+from .gate import BODY_GATE_LABELS, fetch_error, preview
 
 STATES = {"pending_date": "等待可靠日期", "gated_archive": "闸门归档", "discovered": "等待评估", "prefiltered_out": "预筛淘汰",
           "scored_out": "得分不足", "selected": "等待聚簇", "clustered": "已归入事件", "duplicate": "重复链接"}
 REASONS = {"missing_date": "缺少可靠发布日期", "future_date": "发布日期晚于检查时间", "published_after": "早于或等于监控起点",
            "expired": "首次发现时已超过时效窗口", "initial_backfill": "首次导入存量", "before_backfill_window": "超出首次导入范围",
-           "known_url": "已发现此链接", "same_document": "转向已保存的同一文档", "historical_document": "已归档的历史文档"}
+           "known_url": "已发现此链接", "same_document": "转向已保存的同一文档", "historical_document": "已归档的历史文档", **BODY_GATE_LABELS}
 SCORE_VALUE = TypeAdapter(Annotated[float, Field(ge=0, le=100, allow_inf_nan=False)])
 SELECTION_RETRY_NOTICE = "当前仍未公开展示为入选事件，请点击下方「继续处理」以重新进入入选和聚簇流程。"
+REVIEW_ACTIONS = {"release": "送回评估", "score": "人工评分", "assignment": "人工归属"}
 
 
 def saved_sources(archived=None):
@@ -92,10 +94,11 @@ def register(app, page, form_data, redirect, required, text):
             payload = json.loads(str(form.get("entries") or "[]")) if source.kind == "external" else None
             rows = await preview(source, payload, current)
         except ITEM_ERRORS as error:
-            detail = message(error) if isinstance(error, (ValueError, ResearchError)) else f"预览请求失败（{type(error).__name__}）"
-            if isinstance(error, httpx.HTTPStatusError):
-                detail = f"信源拒绝预览请求（HTTP {error.response.status_code}）"
-            return JSONResponse({"error": detail}, status_code=422) if wants_json else source_page(request, source_fields(form), error=detail, edit_id=edit_id)
+            if isinstance(error, (httpx.HTTPError, OSError)):
+                code, detail = "list_request_failed", f"列表页请求失败（{fetch_error(error)}）"
+            else:
+                code, detail = "configuration_or_format", message(error)
+            return JSONResponse({"error": detail, "code": code}, status_code=422) if wants_json else source_page(request, source_fields(form), error=detail, edit_id=edit_id)
         if wants_json:
             return {"items": rows}
         return source_page(request, source_fields(form), preview_rows=rows, edit_id=edit_id)
@@ -154,15 +157,17 @@ def register(app, page, form_data, redirect, required, text):
                                "sum(u.estimate) AS estimate,group_concat(DISTINCT u.model) AS models FROM item_evaluations e "
                                "LEFT JOIN usage u ON u.evaluation_id=e.id WHERE e.item_id=? GROUP BY e.id ORDER BY e.id", (item_id,)) if item else []
         decisions = db.query("SELECT r.*,e.title FROM event_cluster_decisions r JOIN events e ON e.id=r.final_event_id WHERE r.item_id=? ORDER BY r.id DESC", (item_id,)) if item else []
+        reviews = db.query("SELECT * FROM feed_manual_reviews WHERE item_id=? ORDER BY id DESC", (item_id,)) if item else []
         for row in decisions:
             row["candidates"] = station.decode(row["candidates_json"])
         policy = selection()
         for row in rows:
             row["selection_retry"] = jobs.needs_selection_retry(row, policy)
-        return page(request, "admin_funnel.html", title="漏斗诊断", items=rows, item=item, evaluations=evaluations, decisions=decisions,
+        return page(request, "admin_funnel.html", title="漏斗诊断", items=rows, item=item, evaluations=evaluations, decisions=decisions, reviews=reviews, review_actions=REVIEW_ACTIONS,
                     states=STATES, reasons=REASONS, sources=saved_sources(), q=q, state=state, source_id=source_id,
                     threshold=policy.threshold(item["tier"], item["category"]) if item else None,
-                    selection_retry=bool(item and jobs.needs_selection_retry(item, policy)), selection_retry_notice=SELECTION_RETRY_NOTICE)
+                    selection_retry=bool(item and jobs.needs_selection_retry(item, policy)), selection_retry_notice=SELECTION_RETRY_NOTICE,
+                    can_release=bool(item and jobs.can_release(item)))
 
     @router.post("/admin/funnel/{item_id}/score")
     def correct_score(item_id: RecordId, form=Depends(form_data)):
@@ -172,13 +177,14 @@ def register(app, page, form_data, redirect, required, text):
             reason = text(form, "reason", 500)
             policy = selection()
             with db.transaction() as connection:
-                item = connection.execute("SELECT * FROM feed_items WHERE id=? AND (score IS NOT NULL OR manual_score IS NOT NULL)", (item_id,)).fetchone()
+                item = connection.execute("SELECT * FROM feed_items WHERE id=? AND state!='duplicate'", (item_id,)).fetchone()
                 if not item:
-                    raise ValueError("条目尚无可更正的评分")
+                    raise ValueError("条目不存在或已判定为重复链接")
                 state = item["state"]
-                if state in {"selected", "clustered"} and score < policy.threshold(item["tier"], item["category"]):
+                if state not in {"selected", "clustered"} or score < policy.threshold(item["tier"], item["category"]):
                     state = "scored_out"
                 connection.execute("UPDATE feed_items SET manual_score=?,manual_reason=?,state=?,updated_at=? WHERE id=?", (score, reason, state, db.now(), item_id))
+                jobs.record_review(connection, item_id, "score", reason, score=score)
                 if item["event_id"]:
                     update_event(connection, item["event_id"], datetime.now(timezone.utc), policy)
                 selection_retry = jobs.needs_selection_retry({**item, "state": state, "manual_score": score}, policy)
@@ -191,34 +197,48 @@ def register(app, page, form_data, redirect, required, text):
         path = f"/admin/funnel?item_id={item_id}"
         try:
             correct_assignment(item_id, parse_record_id(form.get("event_id")), text(form, "reason", 500))
-            return redirect(path, "事件归属已修正并锁定")
+            item = db.one("SELECT state FROM feed_items WHERE id=?", (item_id,))
+            return redirect(path, "事件归属已修正并锁定" if item["state"] == "clustered" else "已保存指定事件，条目入选后使用此归属")
         except ValueError as error:
             return redirect(path, error=message(error))
 
     @router.post("/admin/funnel/{item_id}/retry")
     def retry(item_id: RecordId, form=Depends(form_data)):
         try:
-            return redirect(f"/tasks/{jobs.retry_item(item_id)}")
+            reason = str(form.get("reason", "")).strip()[:500]
+            return redirect(f"/tasks/{jobs.retry_item(item_id, reason, release=form.get('action') == 'release')}")
         except ValueError as error:
             return redirect(f"/admin/funnel?item_id={item_id}", error=message(error))
 
     @router.get("/admin/eval")
     def evaluate(request: Request):
+        config = settings()
+        context = {"splits": benchmark.SPLITS, "variants": benchmark.VARIANTS, "step_labels": STEP_LABELS, "gate_labels": REASONS,
+                   "config": config}
         try:
             gold = benchmark.samples()
         except (ValueError, OSError) as error:
-            return page(request, "admin_eval.html", title="SelectBench 评测", error=message(error), splits=benchmark.SPLITS, gold=[], reports={})
+            return page(request, "admin_eval.html", title="SelectBench 评测", error=message(error), gold=[], reports={}, **context)
         reports = {}
         for split in benchmark.SPLITS:
-            result = db.one("SELECT id,result_json,finished_at FROM tasks WHERE kind='selectbench' AND status='success' AND json_extract(job_json,'$.split')=? ORDER BY id DESC LIMIT 1", (split,))
+            result = db.one("SELECT id,result_json,finished_at FROM tasks WHERE kind='selectbench' AND status IN ('success','failed') "
+                            "AND json_extract(job_json,'$.split')=? AND (json_type(result_json,'$.comparison')='object' "
+                            "OR json_type(result_json,'$.metrics')='object') "
+                            "ORDER BY id DESC LIMIT 1", (split,))
             if result:
-                reports[split] = {**result, **station.decode(result["result_json"])}
-        return page(request, "admin_eval.html", title="SelectBench 评测", splits=benchmark.SPLITS, gold=gold, reports=reports)
+                report = station.decode(result["result_json"])
+                comparison = report.get("comparison")
+                if not isinstance(comparison, dict):
+                    comparison = {"历史评测": {**report, "usage": benchmark.run_usage(result["id"])}}
+                reports[split] = {**result, "comparison": comparison}
+        return page(request, "admin_eval.html", title="SelectBench 评测", gold=gold, reports=reports, **context)
 
     @router.post("/admin/eval")
     def run_evaluation(form=Depends(form_data)):
         try:
-            return redirect(f"/tasks/{benchmark.enqueue(str(form.get('split')))}")
+            names = form.getlist("variant") if "compare" in form else ["custom"]
+            overrides = {step: str(form.get(step, "")) for step in MODEL_STEPS}
+            return redirect(f"/tasks/{benchmark.enqueue(str(form.get('split')), names, overrides)}")
         except (ValueError, OSError) as error:
             return redirect("/admin/eval", error=message(error))
 

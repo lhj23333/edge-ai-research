@@ -26,6 +26,9 @@ def clean_database():
     with db.transaction() as connection:
         connection.execute("PRAGMA defer_foreign_keys=ON")
         connection.execute("DELETE FROM feed_source_lifecycle")
+        for table in ("feed_manual_reviews", "document_fetch_failures", "entity_aliases", "entity_claims",
+                      "topic_retry_quotas", "content_cache", "research_evidence_versions"):
+            connection.execute(f"DELETE FROM {table}")
         for table in ("daily_briefings", "event_cluster_decisions", "item_evaluations", "feed_observations", "feed_items", "feed_runs", "feed_sources", "evidence_processing", "knowledge_changes", "knowledge_facets", "research_cache", "source_checks", "source_aliases", "research_feedback", "knowledge_evidence", "knowledge_versions", "knowledge_items", "claim_evidence", "research_gaps", "research_experiences", "research_operations", "research_messages", "source_snapshots", "ingestion_queue", "document_chunks", "annotation_versions", "annotations", "judgment_evidence", "judgment_versions", "judgments", "event_topics", "event_entities", "event_claims", "event_aliases", "relations", "entity_fields", "coverage_checks", "daily_issues", "collection_runs", "task_steps", "research_questions", "watchlist_proposals", "claims", "document_versions", "document_task_links", "documents", "events", "briefs", "messages", "artifacts", "usage", "tasks", "research_sessions", "entities", "topics", "runtime"):
             connection.execute(f"DELETE FROM {table}")
         connection.execute("UPDATE station_settings SET watchlist_confirmed=0,sources_confirmed=0,auto_enabled=0,schedule_time='09:00',next_run=NULL,last_attempt_at=NULL,last_success_at=NULL,last_status='never',last_error='',last_visit_at=NULL,last_feed_visible_at=NULL,coverage_json='{}' WHERE id=1")

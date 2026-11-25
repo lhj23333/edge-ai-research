@@ -12,7 +12,7 @@ from ..config import resolve_route
 from ..industry import prompt
 from ..providers import BudgetExceeded, Gateway, ResearchError, UnknownOutcome, completion_choice, structured_json, yield_to_manual
 from .collectors import article, article_date, detail_date, matches_prefix, parse_date, source_config, stamp
-from .gate import existing_item, known_document, processing_source, publication_state, publisher_for, publishers
+from .gate import body_gate, existing_item, known_document, processing_source, publication_state, publisher_for, publishers
 
 DOCUMENT_CHARS = 10000
 SCORE_STAGES = ("score_1", "score_2")
@@ -55,10 +55,10 @@ class Writeup(BaseModel):
 
 
 def model_request(stage, payload, result_model):
-    route = "score" if stage in SCORE_STAGES else stage
-    instruction = prompt("cluster" if route == "cluster_review" else route)
+    route = "score" if stage in SCORE_STAGES else "cluster" if stage in {"write", "cluster_review"} else stage
+    instruction = prompt("write" if stage == "write" else route)
     schema = result_model.model_json_schema()
-    version = continuity.digest([instruction, schema])[:20]
+    version = continuity.digest([instruction, schema, "正文摘要"] if stage == "write" else [instruction, schema])[:20]
     messages = [{"role": "system", "content": instruction},
                 {"role": "user", "content": station.encode({"data": payload, "output_schema": schema})}]
     return route, version, messages
@@ -134,6 +134,27 @@ async def evaluate(task_id, item_id, stage, payload, result_model, semaphore):
     return save_assessment(row, result)
 
 
+async def write_summary(item, content, topics, policy, call):
+    payload = {"content": content[:DOCUMENT_CHARS], "tier": item["tier"], "event_types": policy.event_types, "topics": topics}
+    route, version, _ = model_request("write", payload, Writeup)
+    model = resolve_route(route)
+    namespace = "summary:" + continuity.digest([version, model.profile.provider, str(model.profile.base_url),
+                                                  model.profile.model, model.reasoning_effort, model.output_tokens,
+                                                  {key: value for key, value in payload.items() if key != "content"}])
+    content_hash = continuity.text_hash(content)
+    cached = continuity.cache_get(namespace, content_hash)
+    if cached is not None:
+        return Writeup.model_validate_json(cached, context=payload)
+    summary = await call("write", payload, Writeup)
+    continuity.cache_put(namespace, content_hash, summary.model_dump_json())
+    return summary
+
+
+def reject_body(item, reason):
+    db.execute("UPDATE feed_items SET state='prefiltered_out',gate_reason=?,updated_at=?,error='',next_attempt_at=NULL "
+               "WHERE id=? AND state=? AND manual_score IS NULL", (reason, db.now(), item["id"], item["state"]))
+
+
 def record_evaluation_error(row, error):
     status = "unknown" if isinstance(error, UnknownOutcome) else "failed"
     reason = str(error) if isinstance(error, ResearchError) else "结构化模型返回内容未通过校验"
@@ -168,7 +189,7 @@ async def resolve_publication(item, source, client, policy):
             item.update(current)
             return
         published = parse_date(current["published_at"]) or published
-        state, reason = publication_state(connection, item, published, checked, policy)
+        state, reason = publication_state(connection, current, published, checked, policy)
         update = {"published_at": stamp(published) if published else None, "state": state, "gate_reason": reason}
         connection.execute("UPDATE feed_items SET published_at=?,state=?,gate_reason=?,error='',next_attempt_at=?,updated_at=? WHERE id=?",
                            (*update.values(), stamp(checked + timedelta(hours=6)) if state == "pending_date" else None, stamp(checked), item["id"]))
@@ -180,15 +201,28 @@ async def save_original(item, source, task_id, client, resource, policy):
     checked = db.one("SELECT * FROM source_checks WHERE document_id=?", (known["id"],)) if known else None
     config = source_config(source)
     if resource is None:
-        resource = await article(client, config, item["canonical_url"], checked)
+        try:
+            resource = await article(client, config, item["canonical_url"], checked)
+        except (httpx.HTTPError, OSError) as error:
+            if known:
+                knowledge.record_fetch_failure(known["id"], error)
+            raise
+        if resource.status == 304:
+            knowledge.mark_unchanged(checked["document_id"])
         declared = parse_date(known["published_at"]) if resource.status == 304 else await asyncio.to_thread(detail_date, resource, config)
-        if declared and declared < parse_date(item["published_at"]):
+        published = parse_date(item["published_at"])
+        if declared and published and declared < published:
             with db.transaction() as connection:
-                state, reason = publication_state(connection, item, declared, datetime.now(timezone.utc), policy)
+                current = connection.execute("SELECT * FROM feed_items WHERE id=?", (item["id"],)).fetchone()
+                if current["state"] != item["state"]:
+                    return None
+                state, reason = publication_state(connection, current, declared, datetime.now(timezone.utc), policy)
+                if state == "discovered" and item["state"] == "selected":
+                    state = "selected"
                 item.update(published_at=stamp(declared), state=state, gate_reason=reason)
                 connection.execute("UPDATE feed_items SET published_at=?,state=?,gate_reason=?,updated_at=? WHERE id=?",
                                    (item["published_at"], state, reason, db.now(), item["id"]))
-            if state != "discovered":
+            if state not in {"discovered", "selected"}:
                 return None
     canonical = continuity.canonical_url(resource.url)
     with db.transaction() as connection:
@@ -226,11 +260,6 @@ async def save_original(item, source, task_id, client, resource, policy):
     return content
 
 
-def set_state(item_id, state, **values):
-    columns = {"state": state, "updated_at": db.now(), "error": "", "next_attempt_at": None, **values}
-    db.execute("UPDATE feed_items SET " + ",".join(f"{field}=?" for field in columns) + " WHERE id=?", (*columns.values(), item_id))
-
-
 async def process_item(task_id, item, client, policy, semaphore):
     from .cluster import assign
     yield_to_manual()
@@ -242,10 +271,12 @@ async def process_item(task_id, item, client, policy, semaphore):
     async def call(stage, payload, model):
         return await evaluate(task_id, item["id"], stage, payload, model, semaphore)
 
-    if item["state"] == "pending_date" or (item["state"] == "discovered" and not item["version_id"]):
+    if item["manual_score"] is None and (item["state"] == "pending_date" or
+                                         (item["state"] == "discovered" and (not item["version_id"] or item["manual_release"]))):
         prefilter = await call("prefilter", {"title": item["title"], "summary": item["summary"][:400]}, Prefilter)
         if not prefilter.keep:
-            set_state(item["id"], "prefiltered_out")
+            db.execute("UPDATE feed_items SET state='prefiltered_out',updated_at=?,error='',next_attempt_at=NULL "
+                       "WHERE id=? AND state=? AND manual_score IS NULL", (db.now(), item["id"], item["state"]))
             return
         yield_to_manual()
     if item["state"] == "pending_date":
@@ -261,23 +292,39 @@ async def process_item(task_id, item, client, policy, semaphore):
         with db.transaction() as connection:
             content = connection.execute("SELECT content FROM document_versions WHERE id=?", (item["version_id"],)).fetchone()["content"]
             station.link_document(connection, item["document_id"], task_id, item["version_id"])
-    if item["state"] == "discovered":
-        if not item["version_id"]:
+    else:
+        try:
             content = await save_original(item, source, task_id, client, None, policy)
-            if content is None:
-                return
+        except knowledge.EmptyBody:
+            if item["manual_score"] is not None:
+                raise
+            reject_body(item, "empty_body")
+            return
+        if content is None:
+            return
+    if item["state"] == "discovered":
         score = item["score"]
         if score is None and item["manual_score"] is None:
+            reason = body_gate(content)
+            if reason:
+                reject_body(item, reason)
+                return
             score = await dual_score(call, assessment_payload(item, content))
-        effective = item["manual_score"] if item["manual_score"] is not None else score
-        if effective < policy.threshold(item["tier"], item["category"]):
-            set_state(item["id"], "scored_out", score=score)
+        with db.transaction() as connection:
+            current = connection.execute("SELECT state,manual_score,manual_target_event_id FROM feed_items WHERE id=?", (item["id"],)).fetchone()
+            if current["state"] != "discovered":
+                return
+            effective = current["manual_score"] if current["manual_score"] is not None else score
+            state = "selected" if effective >= policy.threshold(item["tier"], item["category"]) else "scored_out"
+            connection.execute("UPDATE feed_items SET state=?,score=?,updated_at=?,error='',next_attempt_at=NULL WHERE id=?",
+                               (state, score, db.now(), item["id"]))
+        if state == "scored_out":
             return
-        set_state(item["id"], "selected", score=score)
-        item.update(state="selected", score=score)
+        item.update(current)
+        item.update(state=state, score=score)
 
     topics = db.query("SELECT id,title,question FROM topics WHERE research_state='active' ORDER BY id LIMIT 30")
-    summary = await call("write", {**assessment_payload(item, content), "event_types": policy.event_types, "topics": topics}, Writeup)
+    summary = await write_summary(item, content, topics, policy, call)
     supported = {value for value in (entity.name for entity in summary.entities) if station.normalized(value) in station.normalized(item["title"] + " " + content)}
     summary = summary.model_copy(update={"entities": [entity for entity in summary.entities if entity.name in supported],
                                          "topic_ids": sorted(set(summary.topic_ids) & {topic["id"] for topic in topics})})

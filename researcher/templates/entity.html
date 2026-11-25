@@ -31,7 +31,13 @@
       {{ bar(covered, dimensions|length, 'success' if covered == dimensions|length else 'accent') }}
       <ul class="coverage-list">{% for name in dimensions %}<li class="{{ 'is-covered' if name in recorded else '' }}">{{ icon('check' if name in recorded else 'x') }}<span>{{ name }}</span></li>{% endfor %}</ul>
       <p class="field-help">缺失的维度可通过定向研究补充；测试条件缺失时，产品对比不提供性能与功耗排名。</p>
+      {% if aliases %}<p class="meta">型号别名：{{ aliases|map(attribute='name')|join('、') }}</p>{% endif %}
     </section>
+    {% if merged_claims %}<section class="panel"><div class="panel-head"><h2>归并保留的证据</h2></div><div class="list">
+      {% for claim in merged_claims %}<article class="list-item"><strong>{{ claim.statement }}</strong>
+        {% if claim.document_id %}<a href="/documents/{{ claim.document_id }}{% if claim.document_version_id %}?version={{ claim.document_version_id }}{% endif %}">{{ claim.title }}</a>{% endif %}
+      </article>{% endfor %}
+    </div></section>{% endif %}
     {% endif %}
 
     <section class="panel">
@@ -63,6 +69,13 @@
   </div>
 
   <aside class="stack">
+    {% if merge_targets %}<details class="panel"><summary>归并重复产品</summary>
+      <form class="stack-form section-space" action="/entities/{{ item.id }}/merge" method="post">{{ token() }}
+        <label>保留的产品<select name="target_id" required><option value="">请选择同一型号的产品档案</option>{% for target in merge_targets %}<option value="{{ target.id }}">{{ target.name }}</option>{% endfor %}</select></label>
+        <p class="field-help">当前名称会作为别名，相关事件、属性和证据会归入所选档案。</p>
+        <button type="submit" class="button">归并到所选产品</button>
+      </form>
+    </details>{% endif %}
     {% if official_sources %}<section class="panel"><div class="panel-head"><h2>{{ icon('link') }}T1 官方信源</h2></div><div class="list">{% for source in official_sources %}<a class="list-item" href="{{ source.url or ('/admin/sources?edit=' ~ source.id) }}"><strong>{{ source.name }}</strong><small>{{ '已启用采集' if source.enabled else '暂未启用' }}</small></a>{% endfor %}</div></section>{% endif %}
     <section class="panel">
       <div class="panel-head"><h2>{{ icon('link') }}关联关系</h2></div>
